@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "灵动岛与主面板都需要调用自定义命令与核心 IPC",
+  "windows": ["island", "main", "context-menu", "tray-summary"],
+  "permissions": ["core:default", "opener:default"]
+}
