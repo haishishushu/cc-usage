@@ -26,12 +26,12 @@ pub fn open(app: &tauri::AppHandle, island: bool) -> Result<(), String> {
     let handle = window.clone();
     let focused_once = std::sync::atomic::AtomicBool::new(false);
     window.on_window_event(move |event| {
-        if let tauri::WindowEvent::Focused(focused) = event {
-            if *focused {
-                focused_once.store(true, std::sync::atomic::Ordering::Relaxed);
-            } else if focused_once.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = handle.close();
-            }
+        if matches!(event, tauri::WindowEvent::Focused(true)) {
+            focused_once.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if matches!(event, tauri::WindowEvent::Focused(false))
+            && focused_once.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = handle.close();
         }
     });
     // 前端应用布局后由 menu_show 显示，避免空白闪烁与提前失焦。
