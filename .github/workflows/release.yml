@@ -2,15 +2,39 @@ name: 发布桌面安装包
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
+  prepare-continuous-release:
+    name: 更新持续构建标签
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 将 continuous 标签指向本次提交
+        shell: bash
+        run: |
+          git tag --force continuous "${GITHUB_SHA}"
+          git push --force origin refs/tags/continuous
+
   publish:
+    needs: prepare-continuous-release
+    if: always() && (needs.prepare-continuous-release.result == 'success' || needs.prepare-continuous-release.result == 'skipped')
     name: 构建 ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -19,12 +43,19 @@ jobs:
         include:
           - name: Windows x64
             os: windows-latest
+            target: x86_64-pc-windows-msvc
             bundles: nsis
-          - name: macOS
+          - name: macOS Apple Silicon
             os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - name: macOS Intel
+            os: macos-latest
+            target: x86_64-apple-darwin
             bundles: dmg
           - name: Linux x64
             os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
             bundles: appimage,deb
 
     steps:
@@ -47,6 +78,8 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: 缓存 Rust 构建
         uses: Swatinem/rust-cache@v2
@@ -80,11 +113,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: v__VERSION__
-          releaseName: CC Usage v__VERSION__
-          releaseBody: 请在下方选择适合当前系统的安装包。
+          tagName: ${{ github.ref_type == 'tag' && 'v__VERSION__' || 'continuous' }}
+          releaseName: ${{ github.ref_type == 'tag' && 'CC Usage v__VERSION__' || 'CC Usage 持续构建版' }}
+          releaseBody: |
+            请在下方选择适合当前系统的安装包。
+
+            `continuous` 为 main 分支每次提交后自动更新的持续构建版；`v*` 标签为正式稳定版。
           releaseDraft: false
-          prerelease: false
-          args: --bundles ${{ matrix.bundles }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
