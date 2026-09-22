@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>CC Usage installer header</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 150px;
+    height: 57px;
+    overflow: hidden;
+  }
+
+  body {
+    /* MUI2 表头背景是纯白，这里必须同色才能无缝 */
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 13px;
+  }
+
+  /* 缩小版灵动岛，比例与 sidebar 一致（256 画布 ×0.24） */
+  .island {
+    width: 46px;
+    height: 32px;
+    border-radius: 16px;
+    background: #111111;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4.5px;
+    padding-left: 7.2px;
+    box-shadow: 0 3px 8px rgba(17, 17, 17, 0.13);
+  }
+
+  .bar {
+    width: 31px;
+    height: 6.3px;
+    border-radius: 3.2px;
+    background: #3a3a3a;
+    overflow: hidden;
+  }
+
+  .bar > i {
+    display: block;
+    height: 100%;
+    border-radius: 3.2px;
+    background: #06c167;
+  }
+</style>
+</head>
+<body>
+  <div class="island">
+    <div class="bar"><i style="width: 37.5%"></i></div>
+    <div class="bar"><i style="width: 75%"></i></div>
+  </div>
+</body>
+</html>

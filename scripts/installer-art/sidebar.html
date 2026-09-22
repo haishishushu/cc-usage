@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>CC Usage installer sidebar</title>
+<style>
+  /* 字体与前端同源（frontend/public/fonts），不依赖本机是否装过 Inter */
+  @font-face {
+    font-family: "Inter";
+    src: url("{{interFontUrl}}") format("truetype");
+    font-weight: 100 900;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "JetBrains Mono";
+    src: url("{{monoFontUrl}}") format("truetype");
+    font-weight: 100 800;
+    font-style: normal;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 164px;
+    height: 314px;
+    overflow: hidden;
+  }
+
+  body {
+    /* 浅色主题变量取自 frontend/src/index.css：--bg / --surface-2 */
+    background: linear-gradient(180deg, #ffffff 0%, #ffffff 58%, #f7f7f8 100%);
+    /* 右边缘收边，让深浅交界贴住安装窗的白色内容区 */
+    box-shadow: inset -1px 0 0 #e8e8e8;
+    font-family: "Inter", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    position: relative;
+  }
+
+  /* 图标背后的一层极淡绿雾，避免大面积白底显得空 */
+  .haze {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(116px 96px at 50% 33%, rgba(6, 193, 103, 0.13), rgba(6, 193, 103, 0) 70%);
+  }
+
+  .stack {
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 44px 0 18px;
+  }
+
+  /* 灵动岛本体：比例照搬 backend/icons/icon.png（256 画布 ×0.52） */
+  .island {
+    width: 100px;
+    height: 69px;
+    border-radius: 34.5px;
+    background: #111111;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
+    padding-left: 15.5px;
+    box-shadow:
+      0 12px 26px rgba(17, 17, 17, 0.16),
+      0 2px 6px rgba(17, 17, 17, 0.10);
+  }
+
+  .bar {
+    width: 67px;
+    height: 13.5px;
+    border-radius: 7px;
+    background: #3a3a3a;
+    overflow: hidden;
+  }
+
+  .bar > i {
+    display: block;
+    height: 100%;
+    border-radius: 7px;
+    background: #06c167;
+  }
+
+  .wordmark {
+    margin-top: 26px;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    color: #111111;
+  }
+
+  .tagline {
+    margin-top: 9px;
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0.2px;
+    color: #8a8a8a;
+  }
+
+  .spacer { flex: 1; }
+
+  .rule {
+    width: 108px;
+    height: 1px;
+    background: #e8e8e8;
+  }
+
+  .version {
+    margin-top: 11px;
+    font-family: "JetBrains Mono", Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    color: #ababab;
+  }
+</style>
+</head>
+<body>
+  <div class="haze"></div>
+  <div class="stack">
+    <div class="island">
+      <div class="bar"><i style="width: 37.5%"></i></div>
+      <div class="bar"><i style="width: 75%"></i></div>
+    </div>
+    <div class="wordmark">{{productName}}</div>
+    <div class="tagline">Claude · Codex 用量监控</div>
+    <div class="spacer"></div>
+    <div class="rule"></div>
+    <div class="version">v{{version}}</div>
+  </div>
+</body>
+</html>
