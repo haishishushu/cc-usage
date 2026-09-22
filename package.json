@@ -1,0 +1,14 @@
+{
+  "name": "cc-usage",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "pnpm --dir frontend dev",
+    "build": "pnpm --dir frontend build",
+    "tauri": "tauri",
+    "installer-art": "node scripts/installer-art/build.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.7"
+  }
+}
