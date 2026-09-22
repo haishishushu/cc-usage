@@ -1,0 +1,492 @@
+@import "tailwindcss";
+
+/* pencil-new.pen 字体离线分发，不依赖系统安装或运行时联网。 */
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Variable.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Variable.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+/* 深色主题通过根元素 .dark 切换（附录 A.2：两套主题共用同一组变量名） */
+@custom-variant dark (&:is(.dark *));
+
+.settings-section { scroll-margin-top: var(--settings-scroll-offset, 77px); }
+#settings-data { min-height: calc(100dvh - 180px); }
+.unified-settings .setting-row .setting-control > div { flex-wrap: wrap; }
+@media (max-width: 700px) {
+  .unified-settings .setting-control { width: 100%; padding-left: 46px; }
+  .unified-settings .setting-control > * { max-width: 100%; }
+}
+
+/* ---------------------------------------------------------------------------
+   设计变量 —— 严格取自 pencil-new.pen / 需求文档附录 A.2
+   深色是逐项独立取值，不是简单反色，勿自行推导
+--------------------------------------------------------------------------- */
+:root {
+  /* 表面 */
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f7f7f8;
+  --surface-3: #f2f2f3;
+  --hover: #fafafa;
+  /* 文字 */
+  --text-primary: #111111;
+  --text-secondary: #8a8a8a;
+  --text-tertiary: #ababab;
+  /* 边框与轨道 */
+  --border: #e8e8e8;
+  --border-strong: #d6d6d6;
+  --track: #e9ebef;
+  --shadow-color: #0000000f;
+  /* 语义色 */
+  --success: #06c167;
+  --success-soft: #e6f7ee;
+  --success-text: #06834a;
+  --warn: #d98500;
+  --warn-soft: #fdf3e3;
+  --danger: #dc2626;
+  --danger-soft: #fdecec;
+  --accent-blue: #2563eb;
+  --accent-blue-soft: #eaf0fe;
+  --purple-soft: #f1ecfe;
+  --purple-text: #6d40e0;
+  --neutral-soft: #f0f0f1;
+  /* 平台标识 */
+  --logo-claude: #d97757;
+  --logo-codex: #0d0d0d;
+  --logo-gemini: #1a73e8;
+  --logo-grok: #111111;
+  /* 刷新柔光：白底上白高光不可见，浅色主题用深色柔影。
+     0.13 在白底上约是 255→222，可感知；再浅（试过 0.055）几乎看不出来。 */
+  --refresh-shimmer: rgba(15, 15, 20, 0.13);
+
+  /* 趋势图系列色 —— 绿=缓存命中（占九成以上且近乎免费，越省越绿），
+     品红=输出（量小价高，醒目），蓝=输入惯例，琥珀=写缓存的花费动作。
+     这五个色经调色板校验（明度带、色度下限、色盲分离度、对比度）后确定：
+     原本输出用绿、命中用品红，2026-09 二者对调；最差相邻对是绿与琥珀，
+     红绿色盲下 ΔE 8.2、正常视力 23。输出曾试过紫罗兰 #7c3aed，
+     与蓝在红绿色盲下 ΔE 仅 0.4，否决。含成本红全对校验无硬伤。
+     琥珀对白底 2.87:1 略低于 3:1——图例文字、直接标签与悬停数值
+     同时提供身份，颜色不是唯一通道。 */
+  --chart-fresh-input: #2563eb;
+  --chart-output: #c2389b;
+  --chart-cache-write: #d98500;
+  --chart-cache-read: #059669;
+  --chart-cost: #dc2626;
+  /* 网格线与坐标轴保持退让，不与数据争夺注意力 */
+  --chart-grid: #ededed;
+}
+
+@keyframes dock-token-pulse {
+  0% { filter: brightness(1); }
+  42% { filter: brightness(1.65); }
+  100% { filter: brightness(1); }
+}
+
+.dock-token-pulse {
+  animation: dock-token-pulse 300ms ease-out;
+}
+
+@keyframes dock-contract-horizontal {
+  from { opacity: 0.55; transform: scaleX(1.32); }
+  to { opacity: 1; transform: scaleX(1); }
+}
+
+@keyframes dock-contract-vertical {
+  from { opacity: 0.55; transform: scaleY(1.32); }
+  to { opacity: 1; transform: scaleY(1); }
+}
+
+.dock-contract-horizontal { animation: dock-contract-horizontal 180ms cubic-bezier(.2,.8,.2,1); }
+.dock-contract-vertical { animation: dock-contract-vertical 180ms cubic-bezier(.2,.8,.2,1); }
+
+/* 刷新反馈：一道斜向柔光掠过整卡（收缩态、展开态、停靠条同一道光、同一节奏）。
+   刷新是用户主动操作，勿扰模式不抑制；拖动中由 .island-dragging 统一暂停。
+
+   节奏取值的依据：
+   - 恒为 infinite，停止交给 JS 在轮次边界摘除（见 lib/motion.ts useCycleExit）。
+     边界处柔光正好在卡外且 opacity 0，摘除零断裂；也天然保证「至少完整掠一轮」，
+     缓存命中秒回时不会一闪而过。
+   - 1100ms 一轮是从容而非急促的节奏；linear 配合两端淡入淡出，
+     避免 ease 在循环接缝处的速度突变。 */
+@keyframes island-refresh-shimmer {
+  from { transform: translateX(-130%) skewX(-18deg); opacity: 0; }
+  16% { opacity: 1; }
+  84% { opacity: 1; }
+  to { transform: translateX(250%) skewX(-18deg); opacity: 0; }
+}
+
+/* 裁剪层：借 border-radius: inherit 自动贴合卡片 18px 与停靠条 7px 两种圆角。
+   刻意不给卡片本身加 overflow-hidden —— 那会把来源说明的浮层 tooltip 一并裁掉。 */
+.island-refresh-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* 白底卡片上纯白高光是看不见的，所以浅色主题用一道极淡的深色柔影，
+   深色主题才用白色柔光；两者都低到不影响文字可读性。 */
+.island-refresh-shimmer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 45%;
+  /* 峰值做成一段平台而不是一个点：只有中心一个峰时，光带看起来是「一抹灰」，
+     铺开到中段 36%~64% 才读得出是一道掠过的光。 */
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--refresh-shimmer) 36%,
+    var(--refresh-shimmer) 64%,
+    transparent 100%
+  );
+  animation: island-refresh-shimmer 1100ms linear infinite;
+  /* 提前提升合成层：动画只跑 transform/opacity，不占主线程 */
+  will-change: transform, opacity;
+}
+
+.island-dragging *,
+.island-dragging *::before,
+.island-dragging *::after {
+  animation-play-state: paused !important;
+  transition: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dock-token-pulse { animation: none; }
+  .dock-contract-horizontal,
+  .dock-contract-vertical { animation: none; }
+  /* 刷新是用户主动操作，全部关掉会让人不确定点没点上。这里不靠动画
+     （文件末尾的全局兜底会把 animation 压成 0.01ms / 1 次），改成静态柔光
+     铺满整卡：刷新期间常驻，结束时随元素一起移除——有反馈，无运动。 */
+  .island-refresh-shimmer {
+    animation: none !important;
+    transform: none;
+    width: 100%;
+    background: var(--refresh-shimmer);
+  }
+}
+
+.dark {
+  --bg: #0d0d0d;
+  --surface: #181818;
+  --surface-2: #1f1f1f;
+  --surface-3: #242424;
+  --hover: #202020;
+  --text-primary: #f5f5f5;
+  --text-secondary: #8e8e8e;
+  --text-tertiary: #6b6b6b;
+  --border: #292929;
+  --border-strong: #3a3a3a;
+  --track: #303030;
+  --shadow-color: #00000059;
+  --success: #28d07e;
+  --success-soft: #12301f;
+  --success-text: #3adb8b;
+  --warn: #f0a93b;
+  --warn-soft: #3a2a0f;
+  --danger: #f26d6d;
+  --danger-soft: #3a1a1a;
+  --accent-blue: #4f86f7;
+  --accent-blue-soft: #16263f;
+  --purple-soft: #2a2140;
+  --purple-text: #b9a0ff;
+  --neutral-soft: #262626;
+  --logo-claude: #e08a6d;
+  --logo-codex: #f0f0f0;
+  --logo-gemini: #7ca9f5;
+  --logo-grok: #f0f0f0;
+  /* 深色主题反过来：白色柔光。深底上同样的比例更显眼，取值略低于浅色 */
+  --refresh-shimmer: rgba(255, 255, 255, 0.11);
+
+  /* 深色下的图表色是独立取值，不是浅色值的翻转，也不能直接套用深色语义色：
+     --success / --warn 那一组是为**文字**可读性挑的，明度 0.70–0.79 全部高于
+     图表安全带 0.48–0.67，拿来画面积图会在深底上发光刺眼且互相难分。
+     这里保持与浅色相同的色相和相对明暗关系，整体平移进安全带，
+     校验结果：明度带、色度、对比度全部通过，最差色盲分离度 6.2（配合图例与标签）。 */
+  --chart-fresh-input: #2563eb;
+  --chart-output: #be3498;
+  --chart-cache-write: #ca7700;
+  --chart-cache-read: #00b057;
+  --chart-cost: #d82022;
+  --chart-grid: #262626;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-hover: var(--hover);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary: var(--text-tertiary);
+
+  --color-border-base: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-track: var(--track);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-success-text: var(--success-text);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-blue-soft: var(--accent-blue-soft);
+  --color-purple-soft: var(--purple-soft);
+  --color-purple-text: var(--purple-text);
+  --color-neutral-soft: var(--neutral-soft);
+
+  --color-logo-claude: var(--logo-claude);
+  --color-logo-codex: var(--logo-codex);
+  --color-logo-gemini: var(--logo-gemini);
+  --color-logo-grok: var(--logo-grok);
+
+  /* 圆角：r-card 14 / r-island 18 / r-sm 8 */
+  --radius-card: 14px;
+  --radius-island: 18px;
+  --radius-sm2: 8px;
+
+  --font-ui: "Inter", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    font-family: var(--font-ui);
+    background: var(--bg);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+  }
+  /* 灵动岛是无边框透明窗口：背景必须透明，圆角与阴影由岛自身绘制 */
+  html.island-window,
+  html.island-window body,
+  html.island-window #root {
+    background: transparent;
+    overflow: hidden;
+  }
+  /* 附录 A.5-2：所有数字使用等宽数字，避免刷新时抖动 */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  /* 灵动岛 / 卡片 / 弹层三档阴影，对应 .pen 中的 effect 设置 */
+  .shadow-island {
+    box-shadow: 0 2px 10px 0 var(--shadow-color);
+  }
+  .shadow-window {
+    box-shadow: 0 6px 24px 0 var(--shadow-color);
+  }
+  .shadow-popover {
+    box-shadow: 0 6px 22px 0 var(--shadow-color);
+  }
+  .shadow-dialog {
+    box-shadow: 0 10px 32px 0 var(--shadow-color);
+  }
+}
+
+/* 窗口按钮统一命中区域，关闭按钮使用红色交互反馈。 */
+.window-caption-button {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: default;
+  transition: background-color 100ms, color 100ms;
+}
+
+.window-caption-button:hover {
+  background: rgb(0 0 0 / 6%);
+}
+
+.window-caption-button:active {
+  background: rgb(0 0 0 / 10%);
+}
+
+.dark .window-caption-button:hover {
+  background: rgb(255 255 255 / 9%);
+}
+
+.dark .window-caption-button:active {
+  background: rgb(255 255 255 / 6%);
+}
+
+.window-caption-button-close:hover,
+.dark .window-caption-button-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.window-caption-button-close:active,
+.dark .window-caption-button-close:active {
+  background: #c50f1f;
+  color: #fff;
+}
+
+.window-caption-button:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: -2px;
+}
+
+.window-caption-button:disabled {
+  pointer-events: none;
+  color: var(--text-tertiary);
+}
+
+/* 动效提案 20/21：同一节奏用于双主题，避免 transition: all。 */
+:root {
+  --motion-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --motion-feedback: 120ms;
+  --motion-switch: 180ms;
+}
+
+@layer base {
+  button, summary, input, [role="menuitemradio"] {
+    transition: background-color var(--motion-feedback) ease,
+      border-color var(--motion-feedback) ease, color var(--motion-feedback) ease;
+  }
+  button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+  }
+}
+
+.motion-button {
+  transition: transform 120ms var(--motion-ease), background-color 120ms ease,
+    border-color 120ms ease, color 120ms ease, filter 120ms ease;
+}
+.motion-button:not(:disabled):hover { filter: brightness(0.96); }
+.dark .motion-button:not(:disabled):hover { filter: brightness(1.12); }
+.motion-button:not(:disabled):active {
+  transform: translateY(1px);
+  transition-duration: 80ms;
+}
+/* 额度水位落位：刷新反馈是 1100ms 的从容节奏，水位却 200ms 唰一下到位会割裂。
+   宽度与配色同步过渡，避免「条还在滑、颜色已经跳完」。 */
+.motion-quota-bar {
+  transition: width 420ms var(--motion-ease), background-color 420ms ease;
+}
+.motion-toggle { transition: background-color 160ms ease; }
+.motion-toggle-thumb { transition: transform 160ms var(--motion-ease); }
+.motion-indicator {
+  transition: transform 180ms var(--motion-ease), width 180ms var(--motion-ease),
+    background-color 180ms ease, border-color 180ms ease;
+}
+
+/* transition 可从当前帧反向，避免快速关闭时关键帧重新从全不透明开始。 */
+.motion-overlay { opacity: 1; transition: opacity 160ms ease; }
+.motion-dialog { transform: translateY(0) scale(1); transition: transform 200ms var(--motion-ease); }
+.motion-overlay[data-state="closed"] { opacity: 0; transition-duration: 140ms; }
+.motion-overlay[data-state="closed"] .motion-dialog {
+  transform: translateY(4px) scale(0.98);
+  transition-duration: 140ms;
+}
+/* Toast 进出场与对话框同一节奏。用 transition 而非 keyframes：连着弹几条时
+   新条能从当前帧接续，不会各自跳回起点；退场时长与 toastQueue 的 TOAST_EXIT_MS 一致。 */
+.motion-toast {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition: opacity 160ms ease, transform 180ms var(--motion-ease);
+}
+.motion-toast[data-state="closed"] {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+  transition-duration: 140ms;
+}
+.motion-popover {
+  opacity: 1;
+  transform: translateY(0);
+  transform-origin: var(--radix-dropdown-menu-content-transform-origin, top center);
+  transition: opacity 160ms ease, transform 160ms var(--motion-ease);
+}
+.motion-popover[data-side="top"] { --popover-offset: 4px; }
+/* Radix 根据 CSS animation 生命周期延迟卸载；视觉插值由 transition 承接。 */
+@keyframes motion-presence { from { visibility: visible; } to { visibility: visible; } }
+.motion-popover[data-state="closed"] {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(var(--popover-offset, -4px));
+  transition-duration: 120ms;
+  animation: motion-presence 120ms linear;
+}
+@starting-style {
+  .motion-overlay { opacity: 0; }
+  .motion-dialog { transform: translateY(8px) scale(0.98); }
+  .motion-popover { opacity: 0; transform: translateY(var(--popover-offset, -4px)); }
+  .motion-toast { opacity: 0; transform: translateY(-8px) scale(0.98); }
+}
+.motion-select-chevron { transition: transform 160ms var(--motion-ease); }
+[data-state="open"] > .motion-select-chevron { transform: rotate(180deg); }
+
+/* 主题只渐变静态背景，避免全树重绘或覆盖控件的 transform/opacity 过渡。 */
+.theme-transition :where(.bg-bg, .bg-surface, .bg-surface-2, .bg-surface-3):not(button):not(.motion-dialog):not(.motion-popover):not(.motion-indicator) {
+  transition: background-color 180ms ease, border-color 180ms ease;
+}
+
+.island-morph {
+  --island-shell-width: 100%;
+  position: relative;
+  width: 400px;
+  overflow: hidden;
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: 0 2px 10px var(--shadow-color);
+}
+.island-morph::after {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--border);
+  border-radius: inherit;
+}
+.island-morph .island-shell { box-shadow: none; border-color: transparent; background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+  .motion-button:not(:disabled):active { transform: none; }
+}
+/* 保存锁由 fieldset 统一承担；继承锁的无关控件保持原外观。
+   显式 disabled 的控件仍保留其原有禁用样式。 */
+fieldset[data-saving="true"] :disabled:not([disabled]) {
+  opacity: 1;
+}
