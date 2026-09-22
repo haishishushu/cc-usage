@@ -1,0 +1,100 @@
+[
+  {
+    "id": "claude",
+    "name": "Claude",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "api_connection",
+      "local_sessions",
+      "subscription_quota",
+      "organization_usage",
+      "gateway_balance",
+      "realtime_delta",
+      "cost_estimate"
+    ],
+    "limitation": null
+  },
+  {
+    "id": "codex",
+    "name": "Codex",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "api_connection",
+      "local_sessions",
+      "subscription_quota",
+      "organization_usage",
+      "gateway_balance",
+      "realtime_delta",
+      "cost_estimate"
+    ],
+    "limitation": null
+  },
+  {
+    "id": "gemini",
+    "name": "Gemini",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "api_connection",
+      "local_sessions",
+      "realtime_delta"
+    ],
+    "limitation": "本机 Gemini CLI 留存会话；在线订阅额度未验证"
+  },
+  {
+    "id": "grok",
+    "name": "Grok",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "api_connection",
+      "subscription_quota"
+    ],
+    "limitation": "本机 OAuth 积分查询；本机会话格式未验证"
+  },
+  {
+    "id": "zcode",
+    "name": "Zcode",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "local_sessions",
+      "realtime_delta"
+    ],
+    "limitation": "本机用量与缓存；账户剩余额度接口未验证"
+  },
+  {
+    "id": "trae",
+    "name": "Trae",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection"
+    ],
+    "limitation": "Trae IDE 会话与额度格式未验证；只提供本机来源检测"
+  },
+  {
+    "id": "qoder",
+    "name": "Qoder",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "local_sessions",
+      "credits"
+    ],
+    "limitation": "国内／国际版本分别采集；精确 Token 取决于来源可用性，在线额度未验证"
+  },
+  {
+    "id": "workbuddy",
+    "name": "Workbuddy",
+    "availability": "available",
+    "capabilities": [
+      "auth_connection",
+      "local_sessions",
+      "realtime_delta",
+      "credits"
+    ],
+    "limitation": "本机用量、缓存与积分；上下文占用不是套餐额度"
+  }
+]
