@@ -1,0 +1,57 @@
+[package]
+name = "cc-usage"
+version = "0.1.0"
+description = "CC Usage — Windows 桌面 AI 用量监控工具"
+authors = ["ning"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "cc_usage_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+# 应用自更新（updater.rs）：检查端点与公钥在 tauri.conf.json，发布时私钥签名
+tauri-plugin-updater = "2"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SQLite：bundled 直接编译进二进制，不依赖系统 sqlite（§7.7）
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+# 文件系统监听：jsonl 一写入就推事件，避免定时轮询（§7.7）
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+# 额度与余额的只读查询。rustls 避免依赖系统 OpenSSL；blocking 与现有同步代码一致
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "gzip",
+    "system-proxy",
+    # 本地代理的上游流式转发（proxy.rs bytes_stream）
+    "stream",
+] }
+# 火山方舟控制面 OpenAPI 的 AK/SK 签名（火山变体 SigV4，见 coding_plan.rs）
+hmac = "0.12"
+sha2 = "0.10"
+# 本地代理（proxy.rs）：HTTP server 与异步流式转发。
+# hyper / tokio / http 已是 tauri 传递依赖，这里只显式声明需要的特性；
+# 运行时复用 tauri::async_runtime（内部即 tokio），不另起 runtime。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "sync", "time", "io-util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# 保留注释与格式的 TOML 编辑（接管 Codex config.toml 的 base_url，proxy_config.rs）
+toml_edit = "0.22"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
