@@ -35,6 +35,31 @@ backend/target/release/bundle/
 .env
 .env.*
 !.env.example
+
+# 本地数据库及 SQLite 临时文件
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# 私钥、证书容器与本地凭证
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.token
+credentials.json
+credentials.*.json
+auth.json
+auth.*.json
+secrets.json
+secrets.*.json
+
 .DS_Store
 Thumbs.db
 .playwright-mcp/
