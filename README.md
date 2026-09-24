@@ -2,12 +2,21 @@
 
 # CC Usage
 
+[![Release](https://img.shields.io/github/v/release/haishishushu/cc-usage?label=release&logo=github)](https://github.com/haishishushu/cc-usage/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/haishishushu/cc-usage/blob/main/LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue)](https://github.com/haishishushu/cc-usage)
+[![Website](https://img.shields.io/website?url=https%3A%2F%2Fhaishishushu.github.io%2Fcc-usage-website%2F)](https://haishishushu.github.io/cc-usage-website/)
+
 **常驻灵动岛的 AI 用量监控桌面应用**
 
 统一查看 Claude、Codex 等 AI 编程工具的订阅额度、Token 用量与请求日志。
 数据全部来自本机会话记录，不上传、不外发。
+An open-source desktop alternative to CLI usage counters like `ccusage` —
+英文文档见 [README.en.md](./README.en.md)。
 
 [下载安装](https://haishishushu.github.io/cc-usage-website/#/download) · [使用指南](#使用指南) · [项目架构](#项目架构) · [开发者指南](#开发者指南)
+
+中文 | [English](./README.en.md)
 
 ![CC Usage 主面板](./docs/assets/readme/panel-overview.png)
 
@@ -26,6 +35,12 @@ CC Usage 是一款 Windows 桌面应用：屏幕顶部常驻一枚「灵动岛�
 - **订阅额度查询** —— 5 小时 / 7 天窗口水位与重置倒计时直连查询；编程套餐（智谱 GLM、Kimi、MiniMax、ZenMux、OpenCode Go、火山方舟、Grok 等）按连接地址自动识别
 - **请求日志** —— 每条请求的模型、思考强度、输入 / 输出、成本、用时 / 首字与状态码，支持分页与筛选
 - **托盘常驻** —— 关闭主面板只是隐藏，程序在托盘继续工作
+
+### 与 CLI 用量工具的区别
+
+`ccusage` 等命令行工具每次要看用量都得手动跑一次命令；CC Usage 是常驻桌面的图形界面——
+灵动岛实时盯额度，主面板随时回看每一笔请求，且覆盖八个平台与七家编程套餐额度，数据同样全部留在本机。
+（英文对比表见 [README.en.md](./README.en.md#how-it-compares)）
 
 ![灵动岛展开态](./docs/assets/readme/island-expanded.png)
 
