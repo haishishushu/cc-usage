@@ -24,20 +24,26 @@ test("查到套餐窗口（5h/7d）就按真实水位画，API Key 也一样", (
   )
 })
 
-test("API Key 查询成功但没有额度窗口 = 无套餐，画满格蓝（2026-09-19 鼠鼠定版）", () => {
+test("API Key 查询成功但没有额度窗口 = 无套餐，画满格彩虹色", () => {
   assert.deepEqual(dockQuotaView({ ...base, windows: [] }), { type: "unlimited" })
 })
 
-test("只返回总配额、月消费这类非套餐窗口，仍按无套餐画满格蓝（2026-09-19 放宽）", () => {
+test("只返回总配额、月消费这类非套餐窗口，仍按无套餐画满格彩虹色", () => {
   assert.deepEqual(dockQuotaView({ ...base, windows: [win("quota")] }), { type: "unlimited" })
   assert.deepEqual(dockQuotaView({ ...base, windows: [win("30d"), win("1d")] }), { type: "unlimited" })
 })
 
-test("网关明确不提供额度窗口（unsupported）= 无套餐，画满格蓝", () => {
+test("网关明确不提供额度窗口（unsupported）= 无套餐，画满格彩虹色", () => {
   assert.deepEqual(dockQuotaView({ ...base, quotaState: "unsupported" }), { type: "unlimited" })
 })
 
-test("官方 API Key 本就不发额度查询 = 无套餐，画满格蓝", () => {
+test("Auth 已确认没有 5h/7d 时也使用相同的彩虹双轨", () => {
+  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", windows: [win("1d"), win("30d")] }), { type: "unlimited" })
+  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", windows: [] }), { type: "unlimited" })
+  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", quotaState: "unsupported" }), { type: "unlimited" })
+})
+
+test("官方 API Key 本就不发额度查询 = 无套餐，画满格彩虹色", () => {
   assert.deepEqual(dockQuotaView({ ...base, quotaQueried: false, quotaState: null }), { type: "unlimited" })
 })
 
@@ -50,9 +56,9 @@ test("查询中、还没结果、临时失败、凭证失效都不得画满格�
   assert.deepEqual(dockQuotaView({ ...base, quotaState: "forbidden" }), { type: "unknown" })
 })
 
-test("官方订阅缺数据是「查不到」，保持空轨道，不伪装成不限量", () => {
-  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", quotaState: "unsupported" }), { type: "unknown" })
-  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", windows: [] }), { type: "unknown" })
+test("Auth 查询失败不能当作已确认无 5h/7d", () => {
+  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", quotaState: "failed" }), { type: "unknown" })
+  assert.deepEqual(dockQuotaView({ ...base, kind: "auth", quotaLoading: true }), { type: "unknown" })
 })
 
 test("未连接 / 已暂停不画满格", () => {

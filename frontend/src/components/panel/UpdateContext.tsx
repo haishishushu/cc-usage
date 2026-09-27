@@ -13,9 +13,7 @@ import { UpdateContext, type UpdateContextValue } from "./UpdateContextBase"
 /**
  * 更新状态（§更新，画布 17）。
  *
- * 点击绿色按钮 = 直接进入安装（无二次确认）：startInstall 立即调后端
- * install_update_and_restart，下载进度经 update-download-progress 事件推送；
- * Windows 上安装由后端清理托盘与单实例锁后替换文件并自动重启。
+ * 两个更新入口共用状态：先下载并校验，再由安装界面的按钮安装。
  * 浏览器预览（非 Tauri）走内置模拟流程，便于对照画布验收交互。
  *
  * Context 对象在 ./UpdateContextBase（独立文件，防 HMR 实例分裂），
@@ -79,12 +77,13 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
     }
   }, [applyCheck])
 
-  const startInstall = useCallback(() => {
+  const startDownload = useCallback(() => {
     if (busy.current) return
     if (!isTauri) {
-      // 预览：模拟 下载 → 校验安装 → 就绪 的完整节奏（约 3.4s）
+      // 预览：模拟下载，完成后等待用户点击安装。
       busy.current = true
       setPhase("downloading")
+      setError(null)
       setProgress({ downloaded: 0, total: 18.2 * 1024 * 1024 })
       const step = 1024 * 1024
       const tick = (downloaded: number) => {
@@ -92,11 +91,8 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
         if (downloaded < 18.2 * 1024 * 1024) {
           timers.current.push(window.setTimeout(() => tick(downloaded + step * 2), 120))
         } else {
-          setPhase("installing")
-          timers.current.push(window.setTimeout(() => {
-            setPhase("ready")
-            busy.current = false
-          }, 900))
+          setPhase("downloaded")
+          busy.current = false
         }
       }
       timers.current.push(window.setTimeout(() => tick(step * 2), 200))
@@ -109,25 +105,45 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
     let off: (() => void) | undefined
     const unlisten = listenEvent<UpdateProgressDto>("update-download-progress", (p) => {
       setProgress({ downloaded: p.downloaded, total: p.total })
-      if (p.total !== null && p.downloaded >= p.total) setPhase("installing")
     })
     void unlisten
       .then((unsubscribe) => {
         off = unsubscribe
-        return api.installUpdate()
+        return api.downloadAppUpdate()
       })
-      .then(() => {
-        // Windows 上走到这里通常意味着进程本该已被替换重启；仍存活时按就绪展示
-        setPhase("ready")
+      .then((dto) => {
+        applyCheck(dto)
+        setPhase("downloaded")
       })
       .catch((reason) => {
-        setError(`更新失败：${String(reason)}`)
-        setPhase((current) => (current === "ready" ? current : "available"))
+        setError(`下载更新失败：${String(reason)}`)
+        setPhase("downloadError")
       })
       .finally(() => {
         busy.current = false
         off?.()
       })
+  }, [applyCheck])
+
+  const installDownloaded = useCallback(() => {
+    if (busy.current) return
+    busy.current = true
+    setError(null)
+    setPhase("installing")
+    if (!isTauri) {
+      timers.current.push(window.setTimeout(() => {
+        setPhase("ready")
+        busy.current = false
+      }, 900))
+      return
+    }
+    void api.installDownloadedUpdate()
+      .then(() => setPhase("ready"))
+      .catch((reason) => {
+        setError(`安装更新失败：${String(reason)}`)
+        setPhase("downloaded")
+      })
+      .finally(() => { busy.current = false })
   }, [])
 
   const dismiss = useCallback(() => {
@@ -135,10 +151,6 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
     writeDismissedVersion(info.availableVersion)
     setDismissed(info.availableVersion)
   }, [info])
-
-  const restartPreview = useCallback(() => {
-    if (!isTauri) window.location.reload()
-  }, [])
 
   // 启动 1 秒后静默检查；失败不打扰（画布标注：静默重试下次启动）
   useEffect(() => {
@@ -157,11 +169,11 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
         (phase === "idle" || phase === "available") && isUpdateRelevant(info?.availableVersion ?? null, dismissed),
       error,
       checkNow,
-      startInstall,
+      startDownload,
+      installDownloaded,
       dismiss,
-      restartPreview,
     }),
-    [phase, info, progress, dismissed, error, checkNow, startInstall, dismiss, restartPreview],
+    [phase, info, progress, dismissed, error, checkNow, startDownload, installDownloaded, dismiss],
   )
 
   return <UpdateContext.Provider value={value}>{children}</UpdateContext.Provider>

@@ -2,6 +2,7 @@ import { Zap } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { compactTokens, grouped, type UsageBreakdown } from "@/lib/api"
 import { TOKEN_SERIES } from "@/lib/useUsage"
+import { cacheWriteDisplayValue } from "@/lib/cacheWriteDisplay"
 
 /**
  * UsageHero —— 当前统计范围的 Token 分项卡。
@@ -72,10 +73,7 @@ function TopStat({ label, value, tone }: { label: string; value: string | null; 
   )
 }
 
-/**
- * 缓存写入在不同协议下的可得性。OpenAI 协议不区分缓存写入，只上报命中；
- * 这时显示「—」并说明原因，比显示 0 诚实——0 意味着「写过但是零」。
- */
+/** 字段完全缺失时的提示；Codex Auth 上报的可疑零值在下方单独处理。 */
 function cacheWriteHint(platform: string): string {
   return platform === "codex"
     ? "当前记录未提供缓存创建数值；不根据缓存命中反推写入"
@@ -84,6 +82,7 @@ function cacheWriteHint(platform: string): string {
 
 export function UsageHero({
   platform,
+  kind,
   breakdown,
   status,
   error,
@@ -91,6 +90,7 @@ export function UsageHero({
   onRetry,
 }: {
   platform: string
+  kind: "auth" | "api"
   breakdown: UsageBreakdown | null
   status: "loading" | "ready" | "failed"
   error?: string | null
@@ -124,10 +124,12 @@ export function UsageHero({
   }
 
   const { real_total: realTotal, requests, cache_hit_rate: hitRate } = breakdown
+  const cacheWrite = cacheWriteDisplayValue(platform, kind, breakdown.cache_write, requests > 0)
+  const codexWriteUnknown = platform === "codex" && kind === "auth" && breakdown.cache_write === 0 && requests > 0
   const values: Record<string, number | null> = {
     fresh_input: breakdown.fresh_input,
     output: breakdown.output,
-    cache_write: breakdown.cache_write,
+    cache_write: cacheWrite,
     cache_read: breakdown.cache_read,
   }
   // 百分比夹在 0–100：比率来自后端的除法，浮点误差不该让进度条溢出轨道
@@ -185,7 +187,9 @@ export function UsageHero({
               value={value === null ? null : compactTokens(value)}
               hint={
                 spec.key === "cache_write"
-                  ? cacheWriteHint(platform)
+                  ? codexWriteUnknown
+                    ? "Codex Auth 会话记录的零值无法证明实际缓存创建量为零"
+                    : cacheWriteHint(platform)
                   : undefined
               }
             />
@@ -213,6 +217,21 @@ export function UsageHero({
           )}
         </div>
       </div>
+      {codexWriteUnknown ? (
+        <p
+          className="rounded-sm2 border-l-2 bg-surface-2 px-3 py-2 text-[11px] leading-relaxed text-text-secondary"
+          style={{ borderLeftColor: "var(--chart-cache-write)" }}
+        >
+          当前 Codex Auth 记录把缓存创建上报为 0，实际创建量无法核实，因此显示“—”；缓存命中量不能反推创建量。
+        </p>
+      ) : breakdown.cache_write === 0 && breakdown.cache_read !== null && breakdown.cache_read > 0 && (
+        <p
+          className="rounded-sm2 border-l-2 bg-surface-2 px-3 py-2 text-[11px] leading-relaxed text-text-secondary"
+          style={{ borderLeftColor: "var(--chart-cache-write)" }}
+        >
+          当前范围的会话记录上报缓存创建为 0；缓存命中是读取量，不能据此推算创建量。
+        </p>
+      )}
     </div>
   )
 }

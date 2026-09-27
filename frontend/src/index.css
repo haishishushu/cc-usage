@@ -96,6 +96,15 @@
   animation: dock-token-pulse 300ms ease-out;
 }
 
+.dock-unlimited-rainbow {
+  --dock-rainbow-direction: to right;
+  background-image: linear-gradient(var(--dock-rainbow-direction), #ef4444, #f97316, #facc15, #22c55e, #06b6d4, #3b82f6, #a855f7);
+}
+
+.dock-unlimited-rainbow-vertical {
+  --dock-rainbow-direction: to top;
+}
+
 @keyframes dock-contract-horizontal {
   from { opacity: 0.55; transform: scaleX(1.32); }
   to { opacity: 1; transform: scaleX(1); }

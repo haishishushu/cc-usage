@@ -19,6 +19,8 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # 应用自更新（updater.rs）：检查端点与公钥在 tauri.conf.json，发布时私钥签名
 tauri-plugin-updater = "2"
+# 给 updater 注入系统代理地址（UpdaterBuilder::proxy 收 url::Url）
+url = "2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

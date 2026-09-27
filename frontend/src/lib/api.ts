@@ -10,6 +10,7 @@ export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in
 export const localCodexQuota = (force = false) => invoke<QuotaStateDto>("local_codex_quota", { force })
 
 export const localGrokQuota = (force = false) => invoke<QuotaStateDto>("local_grok_quota", { force })
+export const localZcodeQuota = (force = false) => invoke<QuotaStateDto>("local_zcode_quota", { force })
 
 /** 套餐查询辅助凭证的掩码视图；凭证原值永不出后端 */
 export interface PlanQueryStatusDto {
@@ -239,6 +240,7 @@ export interface QuotaWindowDto {
   window_name: string
   used_percent: number | null
   amount_text: string | null
+  remaining_text?: string | null
   resets_at: string | null
 }
 
@@ -362,7 +364,7 @@ export interface UpdateCheckDto {
   pub_date: string | null
 }
 
-/** install_update_and_restart 期间由后端 emit 的下载进度（事件名 update-download-progress） */
+/** download_app_update 期间由后端 emit 的下载进度（事件名 update-download-progress） */
 export interface UpdateProgressDto {
   downloaded: number
   total: number | null
@@ -431,8 +433,10 @@ export const api = {
   setAutostart: (on: boolean) => invoke<boolean>("set_autostart", { on }),
   /** 只查询是否有新版本，不下载（§更新：启动 1 秒后与设置页手动检查共用） */
   checkAppUpdate: () => invoke<UpdateCheckDto>("check_app_update_available"),
-  /** 下载 → 校验签名 → 安装；Windows 上成功返回前后进程会直接重启退出 */
-  installUpdate: () => invoke<boolean>("install_update_and_restart"),
+  /** 下载并验证签名，返回本次下载的版本 */
+  downloadAppUpdate: () => invoke<UpdateCheckDto>("download_app_update"),
+  /** 安装已下载的安装包；Windows 上安装器接管并自动重启 */
+  installDownloadedUpdate: () => invoke<void>("install_downloaded_update_and_restart"),
   setSilentStartup: (on: boolean) => invoke<AppSettings>("set_silent_startup", { on }),
   tokenTotals: (platform: string, custom: CustomRange | null, model: string | null, queryEndMs: number) =>
     invoke<PeriodTotals>("token_totals", { platform, custom, model, queryEndMs }),
@@ -522,7 +526,15 @@ export const api = {
     model?: string | null
     effort?: string | null
     context_1m?: boolean | null
-  }) => invoke<void>("update_connection", { input }),
+  }) => invoke<void>("update_connection", {
+    id: input.id,
+    name: input.name,
+    baseUrl: input.base_url ?? null,
+    secret: input.secret ?? null,
+    model: input.model ?? null,
+    effort: input.effort ?? null,
+    context1m: input.context_1m ?? null,
+  }),
   removeConnection: (id: string) => invoke<void>("remove_connection", { id }),
   fetchCredentials: (id: string) => invoke<FetchResult>("fetch_credentials", { id }),
   replaceApiKey: (id: string, secret: string) => invoke<void>("replace_api_key", { id, secret }),

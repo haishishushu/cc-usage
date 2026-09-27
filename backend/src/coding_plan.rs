@@ -250,6 +250,7 @@ struct ZhipuEntry {
     reset_ms: Option<i64>,
     percent: Option<f64>,
     amount: Option<String>,
+    remaining: Option<String>,
 }
 
 /// 智谱条目按 `unit` 显式分类：3=5 小时滚动窗，6=周窗（number 有 5/7/1 多种实测，
@@ -284,6 +285,9 @@ fn parse_zhipu_windows(data: &serde_json::Value) -> (Vec<QuotaWindow>, Option<St
                 percent: item.get("percentage").and_then(|v| v.as_f64())
                     .filter(|v| v.is_finite() && (0.0..=100.0).contains(v)),
                 amount,
+                remaining: item.get("remaining").and_then(|v| v.as_f64())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| format!("{v:.0} {}", if kind.eq_ignore_ascii_case("CREDIT_LIMIT") { "Credits" } else { "Tokens" })),
             };
             match classify(item) {
                 Some(slot) if slots[slot].is_none() => slots[slot] = Some(entry),
@@ -306,6 +310,7 @@ fn parse_zhipu_windows(data: &serde_json::Value) -> (Vec<QuotaWindow>, Option<St
                 window_name: name.into(),
                 used_percent: e.percent,
                 amount_text: e.amount,
+                remaining_text: e.remaining,
                 resets_at: e.reset_ms.and_then(millis_to_iso),
             });
         }
@@ -381,6 +386,7 @@ fn parse_kimi_windows(body: &serde_json::Value) -> Vec<QuotaWindow> {
                     detail.get("remaining").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 ),
                 amount_text: None,
+                remaining_text: None,
                 resets_at: detail.get("resetTime").and_then(extract_reset_time),
             });
         }
@@ -394,6 +400,7 @@ fn parse_kimi_windows(body: &serde_json::Value) -> Vec<QuotaWindow> {
                 usage.get("remaining").and_then(|v| v.as_f64()).unwrap_or(0.0),
             ),
             amount_text: None,
+            remaining_text: None,
             resets_at: usage.get("resetTime").and_then(extract_reset_time),
         });
     }
@@ -441,6 +448,7 @@ fn parse_minimax_windows(body: &serde_json::Value) -> Vec<QuotaWindow> {
             window_name: W5H.1.into(),
             used_percent: Some(used_of(remain)),
             amount_text: None,
+            remaining_text: None,
             resets_at: item.get("end_time").and_then(|v| v.as_i64()).and_then(millis_to_iso),
         });
     }
@@ -451,6 +459,7 @@ fn parse_minimax_windows(body: &serde_json::Value) -> Vec<QuotaWindow> {
                 window_name: W7D.1.into(),
                 used_percent: Some(used_of(remain)),
                 amount_text: None,
+                remaining_text: None,
                 resets_at: item.get("weekly_end_time").and_then(|v| v.as_i64()).and_then(millis_to_iso),
             });
         }
@@ -512,6 +521,7 @@ fn parse_zenmux_windows(data: &serde_json::Value) -> (Vec<QuotaWindow>, Option<S
                 (Some(used), Some(max)) if max > 0.0 && used.is_finite() => Some(format!("${used:.2} / ${max:.2}")),
                 _ => None,
             },
+            remaining_text: None,
             resets_at: q.get("resets_at").and_then(|v| v.as_str()).map(str::to_string),
         })
     };
@@ -579,6 +589,7 @@ fn parse_opencode_windows(body: &serde_json::Value) -> Vec<QuotaWindow> {
             window_name: name.into(),
             used_percent: Some(percent).filter(|v| v.is_finite() && (0.0..=100.0).contains(v)),
             amount_text: None,
+            remaining_text: None,
             // percent=0 时 resetsAt 是占位值（滚动窗按最后记账时间整窗清零，窗口早已过期）
             resets_at: if percent > 0.0 { w.get("resetsAt").and_then(extract_reset_time) } else { None },
         });
@@ -822,6 +833,7 @@ fn parse_afp_windows(result: &serde_json::Value) -> Vec<QuotaWindow> {
             window_name: name.into(),
             used_percent: Some(used / quota_v * 100.0).filter(|v| v.is_finite() && (0.0..=100.0).contains(v)),
             amount_text: None,
+            remaining_text: None,
             resets_at: win.get("ResetTime").and_then(extract_reset_time),
         });
     }
@@ -855,6 +867,7 @@ fn parse_coding_plan_windows(result: &serde_json::Value) -> Vec<QuotaWindow> {
             window_name: name.into(),
             used_percent: Some(percent).filter(|v| v.is_finite() && (0.0..=100.0).contains(v)),
             amount_text: None,
+            remaining_text: None,
             resets_at: item.get("ResetTime").or_else(|| item.get("ResetTimestamp")).and_then(extract_reset_time),
         });
     }
@@ -906,7 +919,7 @@ mod tests {
     #[test]
     fn pick_probe_hit_prefers_priority_order_over_completion_order() {
         let ok = |key: &str| QuotaState::Ok { windows: vec![QuotaWindow {
-            key: key.into(), window_name: "w".into(), used_percent: Some(1.0), amount_text: None, resets_at: None,
+            key: key.into(), window_name: "w".into(), used_percent: Some(1.0), amount_text: None, remaining_text: None, resets_at: None,
         }], plan: None };
         let failed = |reason: &str| QuotaState::Failed { reason: reason.into() };
         // 完成顺序打乱：低优先级先完成也必须按 PROBE_ORDER 优先级取智谱
@@ -971,9 +984,11 @@ mod tests {
         assert_eq!(windows[0].key, "5h");
         assert_eq!(windows[0].used_percent, Some(47.0));
         assert_eq!(windows[0].amount_text.as_deref(), Some("5710 / 12000 credits"));
+        assert_eq!(windows[0].remaining_text.as_deref(), Some("6289 Credits"));
         assert!(windows[0].resets_at.is_some());
         assert_eq!(windows[1].key, "7d");
         assert_eq!(windows[1].used_percent, Some(9.0));
+        assert_eq!(windows[1].remaining_text.as_deref(), Some("54289 Credits"));
     }
 
     #[test]

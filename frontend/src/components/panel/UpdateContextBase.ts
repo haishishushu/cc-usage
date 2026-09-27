@@ -12,17 +12,17 @@ export interface UpdateContextValue {
   phase: UpdatePhase
   info: UpdateInfo | null
   progress: UpdateProgress
-  /** 绿色按钮是否亮起：有新版本且未被忽略 */
+  /** 左上角更新提示是否显示：有新版本且未被忽略 */
   visible: boolean
   error: string | null
   /** 手动检查（设置页）。返回是否有更新；失败抛错由调用方 toast */
   checkNow: () => Promise<boolean>
-  /** 点击绿色按钮：直接开始下载安装 */
-  startInstall: () => void
+  /** 点击版本入口：下载并校验，随后进入安装界面 */
+  startDownload: () => void
+  /** 点击安装：使用已下载的安装包安装并重启 */
+  installDownloaded: () => void
   /** 忽略此版本：同版本不再亮灯，更新版本仍会提示 */
   dismiss: () => void
-  /** 预览专用：重启完成更新（Tauri 下由后端自动重启，用不到） */
-  restartPreview: () => void
 }
 
 export const UpdateContext = createContext<UpdateContextValue | null>(null)

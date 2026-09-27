@@ -69,6 +69,7 @@ fn parse_codex_usage(body: &str) -> QuotaState {
                 key, window_name: name,
                 used_percent: w.used_percent.filter(|v| v.is_finite() && (0.0..=100.0).contains(v)),
                 amount_text: None,
+                remaining_text: None,
                 resets_at: w.reset_at.and_then(|s| chrono::DateTime::from_timestamp(s, 0))
                     .map(|t| t.to_rfc3339()),
             }
@@ -150,6 +151,9 @@ pub struct QuotaWindow {
     pub used_percent: Option<f64>,
     /// 已用 / 总量的文字描述，来源没给分母时为 None
     pub amount_text: Option<String>,
+    /// 来源直接返回的精确剩余量；无此字段时不推断绝对数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_text: Option<String>,
     /// 重置时间（来源原样透传的 ISO 字符串）
     pub resets_at: Option<String>,
 }
@@ -476,6 +480,7 @@ pub fn claude_oauth_quota(access_token: &str) -> QuotaState {
             window_name: name.into(),
             used_percent: w.utilization.filter(|v| v.is_finite() && (0.0..=100.0).contains(v)),
             amount_text: None,
+            remaining_text: None,
             resets_at: w.resets_at,
         });
     }
@@ -936,6 +941,7 @@ fn s2_quota_from_usage(d: S2Usage) -> QuotaState {
                 used_percent: percent,
                 amount_text: text,
                 // expires_at 是订阅到期时间，不是日/周/月额度的重置时刻。
+                remaining_text: None,
                 resets_at: None,
             });
         }
@@ -949,6 +955,7 @@ fn s2_quota_from_usage(d: S2Usage) -> QuotaState {
             window_name: "总配额".into(),
             used_percent: pct(q.used, q.limit),
             amount_text: Some(amount(q.used, q.limit, &u)),
+            remaining_text: None,
             resets_at: None,
         });
     }
@@ -966,6 +973,7 @@ fn s2_quota_from_usage(d: S2Usage) -> QuotaState {
             window_name: name,
             used_percent: pct(r.used, r.limit),
             amount_text: Some(amount(r.used, r.limit, &unit)),
+            remaining_text: None,
             resets_at: r.reset_at.clone(),
         });
     }

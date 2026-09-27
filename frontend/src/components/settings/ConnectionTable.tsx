@@ -1,5 +1,5 @@
 import { Activity, ChevronDown, LoaderCircle, Pencil, Plus, Plug, Power, Trash2 } from "lucide-react"
-import { useLayoutEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { cn } from "@/lib/utils"
 import { PlatformLogo } from "@/components/brand/PlatformLogo"
 import { Button, ConnectionKindChip } from "@/components/ui/primitives"
@@ -8,6 +8,9 @@ import { canAddConnection } from "@/lib/connectionPlatformTab.ts"
 import { PLATFORMS, platformConfig, isFetchOnlyPlatform } from "@/lib/platforms"
 import { useToast } from "@/components/ui/Toast"
 import { useSlidingIndicator } from "@/lib/useSlidingIndicator"
+import { api, isTauri, localZcodeQuota, type BalanceStateDto, type QuotaStateDto } from "@/lib/api"
+import { isPlanCovered } from "@/lib/planCoverage.ts"
+import { connectionMetricView } from "@/lib/connectionMetricView.ts"
 import type { Connection, PlatformId } from "@/types"
 
 const STATUS = { connected: ["已连接", "text-success-text"], paused: ["已断开", "text-text-tertiary"], expired: ["连接已过期", "text-warn"], invalid: ["凭证无效", "text-danger"], offline: ["离线", "text-warn"] }
@@ -23,12 +26,13 @@ type Props = {
   onEdit: (connection: Connection) => void
   /** 检测连接：用保存的凭证对上游做一次轻量验证并计时（对齐 cc-switch 的检测按钮） */
   onTest: (id: string) => Promise<{ ok: boolean; latency_ms: number; message: string | null }>
+  onRefreshMetrics?: (connection: Connection) => Promise<void>
   onPause: (id: string, paused: boolean) => Promise<void>
   onRemove: (connection: Connection) => void
   loading?: boolean; error?: string | null; onRetry: () => void
 }
 
-function Actions({ connection: c, selectedId, onEnable, onApplyToCli, onTest, onEdit, onPause, onRemove }: Pick<Props, "selectedId" | "onEnable" | "onApplyToCli" | "onTest" | "onEdit" | "onPause" | "onRemove"> & { connection: Connection }) {
+function Actions({ connection: c, selectedId, onEnable, onApplyToCli, onTest, onRefreshMetrics, onEdit, onPause, onRemove }: Pick<Props, "selectedId" | "onEnable" | "onApplyToCli" | "onTest" | "onRefreshMetrics" | "onEdit" | "onPause" | "onRemove"> & { connection: Connection }) {
   const [busy, setBusy] = useState(false)
   const [testing, setTesting] = useState(false)
   const toast = useToast()
@@ -44,9 +48,13 @@ function Actions({ connection: c, selectedId, onEnable, onApplyToCli, onTest, on
     setTesting(true)
     try {
       const result = await onTest(c.id)
+      if (result.ok && c.platformId === "workbuddy") await api.scanLocalSessions()
       if (result.ok) toast.success(`${(isFetchOnlyPlatform(c.platformId) && c.kind === "auth") ? "本机来源可读" : "连接可用"} · ${result.latency_ms}ms`, result.message ?? undefined)
       else toast.danger("连接不可用", result.message ?? "上游验证未通过")
-    } finally { setTesting(false) }
+    } finally {
+      await onRefreshMetrics?.(c)
+      setTesting(false)
+    }
   }
   const toggleConnection = async () => {
     if (toggle.action === "clear") {
@@ -60,7 +68,7 @@ function Actions({ connection: c, selectedId, onEnable, onApplyToCli, onTest, on
       toast.success(`已启用 ${c.name}${(isFetchOnlyPlatform(c.platformId) && c.kind === "auth") ? " 本机监控" : ""}`, note)
     }
   }
-  const style = "motion-button inline-flex h-8 w-[86px] shrink-0 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-accent-blue disabled:cursor-default"
+  const style = "motion-button inline-flex h-8 w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-accent-blue disabled:cursor-default"
   return <div className="flex flex-col items-center gap-1">
     <div className="flex items-center justify-center gap-2">
       <button type="button" disabled={busy || testing || (c.status === "paused" && !(isFetchOnlyPlatform(c.platformId) && c.kind === "auth"))} onClick={() => void run("检测", testConnection)} title={c.status === "paused" ? "连接已断开，请先重新连接" : "用保存的凭证对上游做一次验证并计时"} className={cn(style, "bg-success-soft text-success-text hover:brightness-95 disabled:cursor-default disabled:opacity-50")}>
@@ -74,6 +82,25 @@ function Actions({ connection: c, selectedId, onEnable, onApplyToCli, onTest, on
       </button>
       <button type="button" disabled={busy} onClick={() => onRemove(c)} className={cn(style, "bg-danger-soft text-danger hover:brightness-95 disabled:opacity-50")}><Trash2 aria-hidden className="size-3" />移除</button>
     </div>
+  </div>
+}
+
+type MetricState = { quota: QuotaStateDto | null; balance: BalanceStateDto | null; todayTokens: number | null; totalTokens: number | null; credits: number | null; loading: boolean; updatedAt: Date | null }
+
+function MetricCell({ connection, metric }: { connection: Connection; metric: MetricState | undefined }) {
+  if (connection.status === "paused") return <span className="text-[11px] text-text-tertiary">已断开</span>
+  const native = connection.platformId === "zcode" || connection.platformId === "workbuddy"
+    ? { platform: connection.platformId, totalTokens: metric?.totalTokens ?? null, credits: metric?.credits ?? null }
+    : undefined
+  const view = connectionMetricView(connection.kind, metric?.quota ?? null, metric?.balance ?? null, metric?.todayTokens ?? null, native)
+  const title = [view.reason, view.mode === "metered" ? "Token 按本机平台汇总，不能区分同平台的账号或 Key；余额仅来自网关接口" : null, metric?.updatedAt ? `查询于 ${metric.updatedAt.toLocaleTimeString("zh-CN", { hour12: false })}` : null].filter(Boolean).join("\n")
+  return <div className="flex min-w-0 flex-col gap-0.5 text-left" title={title || undefined}>
+    {view.items.map((item) => <div key={item.label} className="flex min-w-0 items-center justify-between gap-2 text-[11px] leading-4">
+      <span className="shrink-0 text-text-tertiary">{item.label}</span>
+      <span className="min-w-0 truncate font-mono text-text-primary" title={item.title}>{item.value}</span>
+    </div>)}
+    {metric?.loading && <span role="status" className="text-[10px] text-accent-blue">更新中…</span>}
+    {!metric?.loading && view.reason && <span className="truncate text-[10px] text-warn" title={view.reason}>查询受限 · 悬停查看</span>}
   </div>
 }
 
@@ -191,6 +218,40 @@ export function ConnectionTable(props: Props) {
   const canAdd = canAddConnection(platform)
   /** 只展示当前平台的连接；使用中提示仍按全量计算 */
   const rows = connections.filter((c) => c.platformId === platform)
+  const [metrics, setMetrics] = useState<Record<string, MetricState>>({})
+  const requestSerial = useRef<Record<string, number>>({})
+  const refreshMetric = useCallback(async (connection: Connection, force = true) => {
+    if (!isTauri || connection.status === "paused") return
+    const serial = (requestSerial.current[connection.id] ?? 0) + 1
+    requestSerial.current[connection.id] = serial
+    setMetrics((current) => ({ ...current, [connection.id]: { quota: force ? current[connection.id]?.quota ?? null : null, balance: force ? current[connection.id]?.balance ?? null : null, todayTokens: force ? current[connection.id]?.todayTokens ?? null : null, totalTokens: force ? current[connection.id]?.totalTokens ?? null : null, credits: force ? current[connection.id]?.credits ?? null : null, updatedAt: force ? current[connection.id]?.updatedAt ?? null : null, loading: true } }))
+    const queryEndMs = Date.now()
+    const nativeMetrics = connection.platformId === "zcode" || connection.platformId === "workbuddy"
+    const [quota, totals, sourceMetrics] = await Promise.all([
+      (connection.platformId === "zcode" && connection.kind === "auth" ? localZcodeQuota(force) : api.connectionQuota(connection.id, force))
+        .catch((reason): QuotaStateDto => ({ state: "failed", reason: String(reason) })),
+      connection.kind === "api" || nativeMetrics
+        ? api.tokenTotals(connection.platformId, null, null, queryEndMs).catch(() => null)
+        : Promise.resolve(null),
+      connection.platformId === "workbuddy"
+        ? api.sourceMetrics("workbuddy", "total", null, null, queryEndMs).catch(() => null)
+        : Promise.resolve(null),
+    ])
+    const todayTokens = totals?.today ?? null
+    let balance: BalanceStateDto | null = null
+    if (connection.kind === "api" && connection.baseUrl && (quota.state === "ok" || quota.state === "unsupported") && !isPlanCovered(quota.state === "ok" ? quota.windows : null)) {
+      balance = await api.connectionBalance(connection.id, force).catch((reason): BalanceStateDto => ({ state: "failed", reason: String(reason) }))
+    }
+    if (requestSerial.current[connection.id] !== serial) return
+    setMetrics((current) => ({ ...current, [connection.id]: { quota, balance, todayTokens, totalTokens: totals?.total ?? null, credits: sourceMetrics?.credits ?? null, loading: false, updatedAt: new Date() } }))
+  }, [])
+  const rowSignature = rows.map((connection) => [connection.id, connection.kind, connection.status, connection.baseUrl, connection.masked].join(":")).join("|")
+  useEffect(() => {
+    if (!isTauri) return
+    for (const connection of rows) void refreshMetric(connection, false)
+    // 连接列表的内容变化时重查；普通状态刷新不重复请求。
+  }, [rowSignature, refreshMetric])
+  const actions = { ...props, onRefreshMetrics: (connection: Connection) => refreshMetric(connection, true) }
   /** 灵动岛全局只用一个连接，切到别的平台时靠这行说明避免误解 */
   const using = connections.find((c) => c.id === selectedId)
   const name = (c: Connection) => <div className="flex w-full min-w-0 items-center justify-center gap-2 overflow-hidden"><span title={c.name} className="min-w-0 truncate font-mono text-xs">{c.name}</span><ConnectionKindChip kind={c.kind} local={(isFetchOnlyPlatform(c.platformId) && c.kind === "auth") && c.platformId !== "grok"} /></div>
@@ -218,23 +279,24 @@ export function ConnectionTable(props: Props) {
     </div> : <>
       <div className="hidden overflow-hidden rounded-xl border bg-surface min-[1120px]:block">
         <table className="w-full table-fixed text-center text-xs">
-          <colgroup>{[30, 12, 13, 13, 32].map((width, i) => <col key={i} style={{ width: `${width}%` }} />)}</colgroup>
-          <thead className="h-10 border-b bg-surface-2 text-text-secondary"><tr>{["连接名称", "类型", "状态", "最近同步", "操作"].map(label => <th key={label} className="px-2 align-middle font-medium">{label}</th>)}</tr></thead>
-          <tbody>{rows.map(c => <tr key={c.id} className="h-[60px] border-b last:border-b-0 [&>td]:px-2 [&>td]:py-2 [&>td]:align-middle">
+          <colgroup>{[19, 10, 11, 21, 9, 30].map((width, i) => <col key={i} style={{ width: `${width}%` }} />)}</colgroup>
+          <thead className="h-10 border-b bg-surface-2 text-text-secondary"><tr>{["连接名称", "类型", "状态", "额度 / 用量", "最近同步", "操作"].map(label => <th key={label} className="px-2 align-middle font-medium">{label}</th>)}</tr></thead>
+          <tbody>{rows.map(c => <tr key={c.id} className="h-[64px] border-b last:border-b-0 [&>td]:px-2 [&>td]:py-2 [&>td]:align-middle">
             <td className="max-w-0">{name(c)}</td><td className="max-w-0"><span className="block truncate text-text-secondary" title={c.label}>{c.label}</span></td><td>{status(c)}</td>
-            <td className="text-[11px] text-text-tertiary">{c.lastSyncText}</td><td><Actions {...props} connection={c} /></td>
+            <td><MetricCell connection={c} metric={metrics[c.id]} /></td><td className="text-[11px] text-text-tertiary">{c.lastSyncText}</td><td><Actions {...actions} connection={c} /></td>
           </tr>)}</tbody>
         </table>
       </div>
       <div className="overflow-hidden rounded-xl border bg-surface min-[1120px]:hidden">{rows.map(c => <article key={c.id} className="flex min-w-0 flex-col gap-3 border-b p-4 last:border-b-0">
         <div className="flex min-w-0 items-center justify-between gap-3"><div className="flex min-w-0 items-center gap-2"><PlatformLogo platform={c.platformId} size={16} className="shrink-0" />{name(c)}</div><span className="shrink-0">{status(c)}</span></div>
-        <p className="text-center text-[11px] text-text-tertiary">{c.label} · 最近同步 {c.lastSyncText}</p><Actions {...props} connection={c} />
+        <p className="text-center text-[11px] text-text-tertiary">{c.label} · 最近同步 {c.lastSyncText}</p>
+        <div className="rounded-lg bg-surface-2 px-3 py-2"><MetricCell connection={c} metric={metrics[c.id]} /></div><Actions {...actions} connection={c} />
       </article>)}</div>
     </>}
     {error && rows.length > 0 && <div role="alert" className="flex items-center justify-between gap-3 text-xs text-danger"><span>{error}</span><Button onClick={onRetry}>重试</Button></div>}
     <p className="text-[11px] leading-relaxed text-text-tertiary">
       同时仅使用一个灵动岛连接（跨平台唯一）。当前使用中：{using ? `${platformConfig(using.platformId).name} · ${using.name}` : "无"}。
     </p>
-    <p className="text-[11px] leading-relaxed text-text-tertiary">断开保留配置、凭证与历史；本机 Token 按平台统计，无法区分具体账号或 Key。</p>
+    <p className="text-[11px] leading-relaxed text-text-tertiary">断开保留配置、凭证与历史；本机 Token 和积分按平台汇总，无法区分具体账号或 Key；WorkBuddy 已上报积分不是剩余额度。点击「检测」会重新查询当前行的额度与用量。</p>
   </div>
 }

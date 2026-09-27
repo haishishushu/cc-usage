@@ -5,14 +5,14 @@ import { isPlanCovered } from "./planCoverage.ts"
  * 停靠条额度呈现的三种形态（§2.1.3，2026-09-19 鼠鼠定版）：
  *
  * - windows   查到套餐窗口（5h / 7d），按真实水位画
- * - unlimited API Key 无套餐：两条满格蓝色轨道，表示「无套餐上限、按量计费」
+ * - unlimited 已确认没有 5h / 7d 窗口：两条满格彩虹色轨道（内部沿用旧命名）
  * - unknown   未连接 / 查询中 / 临时失败 / 凭证失效：只留空轨道，不着色不画满格
  *
  * 套餐口径与 planCoverage 一致：**有 5h / 7d 窗口才算有套餐**。
- * 网关只返回总配额、月消费这类非套餐窗口时仍按无套餐画满格蓝，
+ * 来源只返回总配额、月消费这类非 5h / 7d 窗口时仍画满格彩虹色，
  * 真实数据在岛卡片与主面板照常展示。
  *
- * 「失败 ≠ 满格」的约定不变：满格蓝只用于**确定性的无套餐结论**，
+ * 「失败 ≠ 满格」的约定不变：满格彩虹色只用于**已确认无 5h / 7d 窗口**，
  * 与「查询失败空轨道」「真实耗尽红色满格」三者可区分。
  */
 export type DockQuotaView =
@@ -40,17 +40,14 @@ export function dockQuotaView(args: {
   windows: QuotaWindow[] | null
 }): DockQuotaView {
   if (!args.connected) return { type: "unknown" }
-  // 官方订阅：查到窗口画真实水位，缺数据是「查不到」，保持空轨道不伪装
-  if (args.kind !== "api") {
-    return args.windows?.length ? { type: "windows", windows: args.windows } : { type: "unknown" }
-  }
-  // 查询中、或查询已发出但还没回来（state 为 null），都不下「无套餐」结论
-  if (args.quotaLoading || (args.quotaQueried && args.quotaState === null)) return { type: "unknown" }
-  if (args.quotaQueried && args.quotaState !== "ok" && args.quotaState !== "unsupported") {
-    // 临时故障与凭证问题不得画满格：满格蓝只代表「确认无套餐」
+  // 官方直连 API Key 不提供套餐查询；Auth 若没有查询入口，仍保持未知。
+  if (!args.quotaQueried) return args.kind === "api" ? { type: "unlimited" } : { type: "unknown" }
+  // 查询中、临时故障与凭证问题不得画满格。
+  if (args.quotaLoading || args.quotaState === null) return { type: "unknown" }
+  if (args.quotaState !== "ok" && args.quotaState !== "unsupported") {
     return { type: "unknown" }
   }
-  // 有套餐窗口画真实水位；没有（无窗口、或只有非套餐窗口）＝无套餐 → 满格蓝
+  // Auth / API Key 一律按实际窗口判定；仅有其他窗口时仍保留其真实数据在卡片中。
   return args.windows?.length && isPlanCovered(args.windows)
     ? { type: "windows", windows: args.windows }
     : { type: "unlimited" }

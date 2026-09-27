@@ -41,7 +41,7 @@
       "local_sessions",
       "realtime_delta"
     ],
-    "limitation": "本机 Gemini CLI 留存会话；在线订阅额度未验证"
+    "limitation": "本机 Gemini CLI 留存会话；在线剩余额度未接入"
   },
   {
     "id": "grok",
@@ -52,7 +52,7 @@
       "api_connection",
       "subscription_quota"
     ],
-    "limitation": "本机 OAuth 积分查询；本机会话格式未验证"
+    "limitation": "本机 OAuth 可查 SuperGrok 订阅剩余百分比；API 预付余额需独立管理授权"
   },
   {
     "id": "zcode",
@@ -61,9 +61,10 @@
     "capabilities": [
       "auth_connection",
       "local_sessions",
+      "subscription_quota",
       "realtime_delta"
     ],
-    "limitation": "本机用量与缓存；账户剩余额度接口未验证"
+    "limitation": "本机 ZCode BigModel Coding Plan API Key 可查套餐剩余；账号 OAuth 额度未接入"
   },
   {
     "id": "trae",
@@ -72,7 +73,7 @@
     "capabilities": [
       "auth_connection"
     ],
-    "limitation": "Trae IDE 会话与额度格式未验证；只提供本机来源检测"
+    "limitation": "只提供本机来源检测；企业成员额度需管理员授权，个人额度未验证"
   },
   {
     "id": "qoder",
@@ -83,7 +84,7 @@
       "local_sessions",
       "credits"
     ],
-    "limitation": "国内／国际版本分别采集；精确 Token 取决于来源可用性，在线额度未验证"
+    "limitation": "国内／国际版本分别采集本机消耗；在线剩余积分需 Qoder Agent SDK"
   },
   {
     "id": "workbuddy",
@@ -95,6 +96,6 @@
       "realtime_delta",
       "credits"
     ],
-    "limitation": "本机用量、缓存与积分；上下文占用不是套餐额度"
+    "limitation": "本机用量、缓存与已上报积分；在线个人剩余积分需开放平台授权"
   }
 ]

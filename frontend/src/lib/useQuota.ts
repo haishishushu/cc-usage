@@ -6,6 +6,7 @@ import {
   listenEvent,
   localCodexQuota,
   localGrokQuota,
+  localZcodeQuota,
   isTauri,
   type BalanceStateDto,
   type ApiUsageStateDto,
@@ -46,10 +47,9 @@ export interface QuotaResult {
 }
 
 /**
- * 本地直查模式：`true` = 本机 Codex（历史布尔签名，保持兼容），`"grok"` = 本机 Grok。
- * 两者都不依赖连接，凭证分别来自 ~/.codex 与 ~/.grok。
+ * 本地直查模式：`true` = Codex，`"grok"` = Grok，`"zcode"` = ZCode BigModel Key。
  */
-export function useQuota(connectionId: string | null, local: boolean | "grok" = false, enabled = true): QuotaResult {
+export function useQuota(connectionId: string | null, local: boolean | "grok" | "zcode" = false, enabled = true): QuotaResult {
   const interval = refreshDelay(useSettings().settings.refresh_minutes)
   const requestId = useRef(0)
   const queryKey = `${connectionId}:${local}`
@@ -69,6 +69,8 @@ export function useQuota(connectionId: string | null, local: boolean | "grok" = 
         ? await localCodexQuota(force)
         : local === "grok"
           ? await localGrokQuota(force)
+          : local === "zcode"
+            ? await localZcodeQuota(force)
           : await api.connectionQuota(connectionId!, force)
       if (current !== requestId.current) return
       if (r.state === "ok") {

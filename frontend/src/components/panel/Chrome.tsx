@@ -103,7 +103,7 @@ export function TitleBar({ title = "CC Usage" }: { title?: string }) {
       <div className="flex items-center gap-2">
         <AppIcon size={16} />
         <span className="text-xs font-medium text-text-primary">{title}</span>
-        {/* 有新版本时亮起的绿色更新按钮；点击直接进入安装（画布 17） */}
+        {/* 启动检查发现新版本后，在主面板左上角显示下载入口。 */}
         <UpdateBadge />
       </div>
       <div className="flex h-full shrink-0 items-center">

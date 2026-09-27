@@ -60,18 +60,18 @@ function SettingsHeading({ icon: Icon, children }: { icon: LucideIcon; children:
   </div>
 }
 
-/** 关于与更新（画布 17 · C）：发现新版后按钮转绿，点击与标题栏绿灯一致直接安装 */
+/** 关于与更新：发现新版后按钮转黄，点击下载并进入安装界面 */
 function AboutUpdateRow() {
   const update = useUpdate()
   const toast = useToast()
-  const { phase, info, checkNow, startInstall, dismiss } = update
+  const { phase, info, checkNow, startDownload, dismiss } = update
   const checking = phase === "checking"
-  const updating = phase === "downloading" || phase === "installing" || phase === "ready"
+  const updating = phase === "downloading" || phase === "downloadError" || phase === "downloaded" || phase === "installing" || phase === "ready"
   const hasUpdate = !!info && (phase === "idle" || phase === "available")
 
   const onCheck = () => {
     void checkNow()
-      .then((available) => toast.success(available ? `发现新版本 v${update.info?.availableVersion ?? ""}` : "已是最新版本"))
+      .then((available) => toast.success(available ? "发现新版本，已显示更新按钮" : "已是最新版本"))
       .catch((reason) => toast.danger("检查更新失败", String(reason)))
   }
 
@@ -80,24 +80,24 @@ function AboutUpdateRow() {
       label="关于与更新"
       desc={
         hasUpdate && info
-          ? `当前版本 v${info.currentVersion} · 发现新版本，点击立即安装`
-          : "启动 1 秒后自动检查更新；更新在应用内下载安装并自动重启，期间采集不受影响"
+          ? `当前版本 v${info.currentVersion} · 发现新版本，点击下载后安装`
+          : "启动后自动检查更新；下载完成后点击一次安装，应用自动重启"
       }
       control={
         updating ? (
           <span className="flex items-center gap-1.5 rounded-[8px] bg-neutral-soft px-3 py-1.5 text-xs text-text-secondary">
-            <LoaderCircle className="size-3.5 animate-spin" aria-hidden />
-            更新中…
+            {phase === "downloading" || phase === "installing" ? <LoaderCircle className="size-3.5 animate-spin" aria-hidden /> : null}
+            {phase === "downloaded" ? "等待安装" : phase === "downloadError" ? "下载失败" : "更新中…"}
           </span>
         ) : hasUpdate && info ? (
           <span className="flex items-center gap-2">
             <button
               type="button"
-              onClick={startInstall}
-              className="flex items-center gap-1.5 rounded-[8px] bg-success-soft px-3 py-1.5 text-xs font-semibold text-success-text transition-colors hover:bg-success hover:text-white"
+              onClick={startDownload}
+              className="flex items-center gap-1.5 rounded-[8px] bg-warn-soft px-3 py-1.5 text-xs font-semibold text-warn transition-colors hover:bg-warn hover:text-white"
             >
               <CircleArrowUp className="size-3.5" aria-hidden />
-              更新到 v{info.availableVersion}
+              更新 v{info.availableVersion}
             </button>
             <button
               type="button"
@@ -115,7 +115,7 @@ function AboutUpdateRow() {
             type="button"
             onClick={onCheck}
             disabled={checking}
-            className="flex items-center gap-1.5 rounded-[8px] bg-neutral-soft px-3 py-1.5 text-xs font-medium text-text-secondary disabled:opacity-60"
+            className="flex items-center gap-1.5 rounded-[8px] bg-success-soft px-3 py-1.5 text-xs font-semibold text-success-text transition-colors hover:bg-success hover:text-white disabled:pointer-events-none disabled:opacity-60"
           >
             {checking ? <LoaderCircle className="size-3.5 animate-spin" aria-hidden /> : <RefreshCw className="size-3.5" aria-hidden />}
             检查更新
@@ -305,7 +305,11 @@ function PlanQuerySection() {
             await conn.reload()
             return note
           }}
-          onTest={(id) => api.testConnection(id)}
+          onTest={async (id) => {
+            const result = await api.testConnection(id)
+            if (result.ok) await conn.reload()
+            return result
+          }}
           selectedId={cfg.settings.island_connection_id}
           onRemove={onRemove}
           onPause={conn.setPaused}

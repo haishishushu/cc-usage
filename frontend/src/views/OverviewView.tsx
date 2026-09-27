@@ -16,6 +16,7 @@ import { useConnections } from "@/lib/useConnections"
 import { shouldRefreshConnection } from "@/lib/refreshScope"
 import { useApiUsage, useBalance, useCostEstimate, useQuota } from "@/lib/useQuota"
 import { toQuotaWindows } from "@/lib/quotaMap"
+import { authQuotaRows } from "@/lib/authQuotaRows"
 import { isPlanCovered, planCoverageHint } from "@/lib/planCoverage.ts"
 import type { QueryState } from "@/components/panel/QueryStateNotice"
 import { BALANCE, CLAUDE_QUOTAS } from "@/mock/data"
@@ -24,6 +25,9 @@ import { shortModelName } from "@/lib/modelName"
 import type { PlatformId, StatPeriod } from "@/types"
 import { platformConfig, isFetchOnlyPlatform, platformSupports } from "@/lib/platforms"
 import { NativeSourcePanel } from "@/components/panel/NativeSourcePanel"
+import { RemainingCard } from "@/components/panel/RemainingCard"
+import { remainingDisplay } from "@/lib/remainingDisplay"
+import { cacheWriteDisplayValue } from "@/lib/cacheWriteDisplay"
 import { useCollectionStatus } from "@/lib/useCollectionStatus"
 
 /** C/TokenCard：w200 padding16 gap6 r14；标签 fs12 → 数值 fs22/600 → 来源提示 fs11 */
@@ -173,6 +177,7 @@ export function OverviewView({
   const balance = useBalance(active?.status === "paused" ? null : active?.id ?? null, panelActive)
   // Grok 不走连接：额度直接来自本机 grok CLI 凭证（~/.grok/auth.json）
   const grokQuota = useQuota(null, "grok", panelActive && platform === "grok" && effectiveVariant === "auth")
+  const zcodeQuota = useQuota(null, "zcode", panelActive && platform === "zcode" && effectiveVariant === "auth")
   /**
    * 套餐判定按实际查到的额度窗口走：有 5 小时 / 周额度的就是套餐，其余按 API Key 计费。
    * Grok 走独立的积分额度接口，key 是 credits，不落入这两个窗口，因此照常显示估算金额。
@@ -265,6 +270,13 @@ export function OverviewView({
       }
     : BALANCE
 
+  const chartSeries = chart.series.map((series) => series.key === "cache_write"
+    ? { ...series, values: series.values.map((value, index) => cacheWriteDisplayValue(
+        platform, effectiveVariant, value,
+        chart.series.some((other) => other.key !== "cache_write" && (other.values[index] ?? 0) > 0),
+      )) }
+    : series)
+
   return (
     <div className="flex w-full flex-col gap-7 p-8">
       {collection.status && !collection.status.ok && (
@@ -316,17 +328,17 @@ export function OverviewView({
 
       <div ref={connectionMotion}>
       {platform === "grok" && effectiveVariant === "auth" ? (
-        <UsageCard
-          title="Grok · SuperGrok"
-          kind="auth"
-          statusLabel="本机凭证"
-          statusTone="success"
-          updatedText="额度来源：grok.com 计费接口 · 凭证来自本机 grok CLI（~/.grok/auth.json）"
-          quotas={grokQuota.state?.state === "ok" ? toQuotaWindows(grokQuota.state.windows, quotaNow) : []}
-          {...quotaNotice(grokQuota, true)}
-        />
+        <RemainingCard display={remainingDisplay("grok", "auth", grokQuota.state)} fetchedAt={grokQuota.fetchedAt} stale={grokQuota.stale} loading={grokQuota.loading} />
+      ) : platform === "zcode" && effectiveVariant === "auth" ? (
+        <div className="flex flex-col gap-4">
+          <RemainingCard display={remainingDisplay("zcode", "auth", zcodeQuota.state)} fetchedAt={zcodeQuota.fetchedAt} stale={zcodeQuota.stale} loading={zcodeQuota.loading} />
+          <NativeSourcePanel platform={platform} period={period} custom={custom} model={model} queryEndMs={queryEndMs} />
+        </div>
       ) : isFetchOnlyPlatform(platform) ? (
-        <NativeSourcePanel platform={platform} period={period} custom={custom} model={model} queryEndMs={queryEndMs} />
+        <div className="flex flex-col gap-4">
+          <RemainingCard display={remainingDisplay(platform, effectiveVariant, null)} />
+          {effectiveVariant === "auth" && <NativeSourcePanel platform={platform} period={period} custom={custom} model={model} queryEndMs={queryEndMs} />}
+        </div>
       ) : effectiveVariant === "auth" ? (
         <UsageCard
           title={
@@ -343,7 +355,11 @@ export function OverviewView({
               : "额度来源：账号额度接口"
           }
           quotas={
-            quota.state?.state === "ok" ? toQuotaWindows(quota.state.windows, quotaNow) : CLAUDE_QUOTAS
+            quota.state?.state === "ok"
+              ? platform === "codex"
+                ? authQuotaRows(toQuotaWindows(quota.state.windows, quotaNow), "账号额度接口未返回该窗口")
+                : toQuotaWindows(quota.state.windows, quotaNow)
+              : CLAUDE_QUOTAS
           }
           {...(active?.status === "paused" ? { queryState: "unsupported" as QueryState, reason: "连接已断开，远程查询已暂停；可在设置中重新连接。本机历史统计继续保留。" } : quotaNotice(quota, !!active))}
         />
@@ -494,6 +510,7 @@ export function OverviewView({
 
         <UsageHero
           platform={platform}
+          kind={effectiveVariant}
           breakdown={breakdown}
           status={breakdownStatus}
           error={breakdownError}
@@ -530,14 +547,16 @@ export function OverviewView({
               : "按公开价目表乘 Token 数推算，不含套餐折扣与批处理折扣，与实际账单会有差异。")}
             {cost.complete && cost.uncovered_tokens > 0 &&
               ` 另有 ${grouped(cost.uncovered_tokens)} Token 的模型不在价目表内，未计入。`}
+            {cost.complete && platform === "codex" && effectiveVariant === "auth" && breakdown?.cache_write === 0 && breakdown.requests > 0 &&
+              " 缓存创建量无法核实，折算金额可能未计入缓存写入溢价。"}
           </p>
         )}
         <Hint>
           当前统计来自本平台本机会话记录，无法按具体账号或 API Key 区分；「真实消耗」含缓存重读（每次请求都会重复计入上下文），
           因此大于灵动岛实时数——灵动岛与 Claude Code 终端一致，只计新鲜 Token（输入+输出）。
           「新增输入」已扣除缓存重读，是与灵动岛口径一致的那部分。
-          「缓存创建」与「缓存命中」按会话记录中的对应字段统计：记录为 0 时显示 0，字段缺失时显示「—」。
-          仅凭记录中的 0 无法判断服务端是否实际创建了缓存，也无法推断缓存创建是否计入其他字段。
+          「缓存创建」与「缓存命中」按会话记录中的对应字段统计。Codex Auth 的缓存创建零值无法证明实际创建量为零，显示「—」；
+          其他来源记录为 0 时显示 0，字段缺失时显示「—」。缓存命中量不能反推创建量。
         </Hint>
       </section>
 
@@ -559,7 +578,7 @@ export function OverviewView({
         ) : trendStatus === "empty" ? (
           <div className="grid h-[300px] place-items-center rounded-card border bg-surface text-xs text-text-tertiary">当前范围暂无趋势数据</div>
         ) : (
-          <UsageAreaChart labels={chart.labels} series={chart.series} cost={chart.cost} />
+          <UsageAreaChart labels={chart.labels} series={chartSeries} cost={chart.cost} />
         )}
         </div>
         <Hint>

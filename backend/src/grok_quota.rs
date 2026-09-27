@@ -96,6 +96,7 @@ fn query_grok(access_token: &str) -> QuotaState {
             window_name: name.into(),
             used_percent: Some(snapshot.used_percent.clamp(0.0, 100.0)),
             amount_text: None,
+            remaining_text: None,
             resets_at: snapshot.resets_at
                 .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
                 .map(|dt| dt.to_rfc3339()),

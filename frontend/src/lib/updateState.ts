@@ -1,12 +1,12 @@
 /**
  * 更新功能的纯状态逻辑。
  *
- * 检查与安装走 Tauri updater 插件（后端命令封装，见 useUpdate.ts），
+ * 检查、下载与安装走 Tauri updater 插件（后端命令封装见 api.ts），
  * 这里只放界面推导所需的纯函数：忽略版本的记忆、进度换算与字节数格式化，
  * 便于 node --test 直接验证。
  */
 
-export type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "installing" | "ready"
+export type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "downloadError" | "downloaded" | "installing" | "ready"
 
 export interface UpdateInfo {
   currentVersion: string

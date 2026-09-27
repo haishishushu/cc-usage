@@ -21,9 +21,36 @@ pub struct Summary {
 struct Quota { key: String, value: String }
 
 fn cache_key(settings: &crate::settings::Settings) -> Option<String> {
+    if settings.island_platform == "grok" && settings.island_kind == "auth" {
+        return Some("local-grok".into());
+    }
+    if settings.island_platform == "zcode" && settings.island_kind == "auth" {
+        return Some("local-zcode".into());
+    }
     settings.island_connection_id.clone().or_else(|| {
-        (settings.island_platform == "codex" && settings.island_kind == "auth").then(|| "local-codex".into())
+        if settings.island_kind != "auth" { return None; }
+        match settings.island_platform.as_str() {
+            "codex" => Some("local-codex".into()),
+            _ => None,
+        }
     })
+}
+
+fn remaining_percent(used: Option<f64>) -> Option<String> {
+    let used = used.filter(|value| value.is_finite())?;
+    let remaining = ((100.0 - used.clamp(0.0, 100.0)) * 10.0).round() / 10.0;
+    Some(if remaining.fract() == 0.0 { format!("{remaining:.0}%") } else { format!("{remaining:.1}%") })
+}
+
+fn native_remaining_reason(platform: &str) -> &'static str {
+    match platform {
+        "gemini" => "未接入在线项目余额查询；本机 Token 为消耗量",
+        "zcode" => "此 API 连接未绑定本机 ZCode BigModel Key",
+        "trae" => "企业额度需管理员授权；个人额度暂不可查询",
+        "qoder" => "剩余积分需 Qoder Agent SDK；本机积分为消耗量",
+        "workbuddy" => "剩余积分需第三方应用授权；本机积分为消耗量",
+        _ => "剩余额度暂不可查询",
+    }
 }
 
 pub fn current_state(app: &tauri::AppHandle) -> crate::quota::QuotaState {
@@ -103,22 +130,21 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
     let cfg = app.state::<crate::Cfg>().0.get();
     let platform = crate::platform_name(&cfg.island_platform);
     let kind = if cfg.island_kind == "auth" { "Auth" } else { "API Key" };
-    let name = cfg.island_connection_name.as_deref().unwrap_or(if cache_key(&cfg).as_deref() == Some("local-codex") { "本机授权" } else { "未选择连接" });
+    let name = cfg.island_connection_name.as_deref().unwrap_or(match cache_key(&cfg).as_deref() {
+        Some("local-zcode") => "本机 BigModel Key",
+        Some("local-codex" | "local-grok") => "本机授权",
+        _ => "未选择连接",
+    });
     let mut summary = Summary { connection: format!("{platform} · {kind} · {name}"), quotas: vec![], updated_at: None, message: "尚无额度数据".into() };
-    if crate::platforms::native(&cfg.island_platform) && cfg.island_platform!="grok" {
-        summary.message="本机留存记录；积分非余额，无法按账号区分".into();
-        if let Some(db)=app.try_state::<crate::Db>() {
-            if let Ok(conn)=db.0.lock() {
-                let now=chrono::Utc::now().timestamp_millis();
-                let (start,end)=crate::db::period_range_at(&conn,&cfg.island_platform,"today",now);
-                let tokens=crate::db::today_fresh_tokens(&conn,&cfg.island_platform).ok().flatten();
-                summary.quotas.push(Quota { key:"本机今日 Token".into(),value:tokens.map(|n|thousands(n.max(0) as u64)).unwrap_or_else(||"—".into()) });
-                if crate::platforms::supports(&cfg.island_platform,"credits") {
-                    let credits=crate::source_store::metrics(&conn,&cfg.island_platform,start,end,None).ok().and_then(|m|m.credits);
-                    summary.quotas.push(Quota {key:"今日上报积分".into(),value:credits.map(|n|format!("{n:.4}")).unwrap_or_else(||"—".into())});
-                }
-            }
-        }
+    if crate::platforms::native(&cfg.island_platform) && cfg.island_platform != "grok"
+        && !(cfg.island_platform == "zcode" && cfg.island_kind == "auth") {
+        summary.message=native_remaining_reason(&cfg.island_platform).into();
+        summary.quotas.push(Quota { key:"剩余额度".into(), value:"—".into() });
+        return summary;
+    }
+    if cfg.island_platform == "grok" && cfg.island_kind == "api" {
+        summary.quotas.push(Quota { key: "xAI API 预付余额".into(), value: "—".into() });
+        summary.message = "需要独立 Management Key 和团队 ID".into();
         return summary;
     }
     if let Some(key) = cache_key(&cfg) {
@@ -126,6 +152,28 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
             if let Some((state, expires, _)) = cache.entries.get(&key) {
                 match state {
                     crate::quota::QuotaState::Ok { windows, .. } => {
+                        if cfg.island_platform == "grok" {
+                            summary.quotas = windows.iter().map(|window| Quota {
+                                key: "SuperGrok 剩余".into(),
+                                value: remaining_percent(window.used_percent).unwrap_or("—".into()),
+                            }).collect();
+                            let captured = *expires - std::time::Duration::from_secs(300);
+                            summary.updated_at = Some(chrono::Utc::now().timestamp_millis() - captured.elapsed().as_millis() as i64);
+                            summary.message = if summary.quotas.is_empty() { "来源未提供额度" } else { "" }.into();
+                            return summary;
+                        }
+                        if cfg.island_platform == "zcode" && cfg.island_kind == "auth" {
+                            summary.quotas = windows.iter().map(|window| Quota {
+                                key: if window.key == "5h" { "5 小时剩余" } else { "周剩余" }.into(),
+                                value: window.remaining_text.clone()
+                                    .or_else(|| remaining_percent(window.used_percent))
+                                    .unwrap_or("—".into()),
+                            }).collect();
+                            let captured = *expires - std::time::Duration::from_secs(300);
+                            summary.updated_at = Some(chrono::Utc::now().timestamp_millis() - captured.elapsed().as_millis() as i64);
+                            summary.message = if summary.quotas.is_empty() { "来源未提供额度" } else { "" }.into();
+                            return summary;
+                        }
                         // API Key 且确认无 5h/7d 套餐窗口：改显「今日Token + 剩余金额」
                         //（2026-09-19 鼠鼠定版）。查询失败/凭证失效不算无套餐，仍按原样说明原因。
                         if cfg.island_kind == "api" && !has_plan_windows(windows) {
@@ -142,6 +190,14 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
                             summary.message = if windows.is_empty() { "来源未提供额度窗口" } else { "" }.into();
                         }
                     }
+                    crate::quota::QuotaState::Unsupported { reason }
+                    | crate::quota::QuotaState::Unauthorized { reason }
+                    | crate::quota::QuotaState::Forbidden { reason }
+                    | crate::quota::QuotaState::RateLimited { reason }
+                    | crate::quota::QuotaState::Failed { reason }
+                        if cfg.island_platform == "zcode" && cfg.island_kind == "auth" => {
+                        summary.message = reason.clone();
+                    }
                     crate::quota::QuotaState::Unsupported { .. } if cfg.island_kind == "api" => {
                         // 明确不提供订阅额度 = API Key 无套餐的确定性结论
                         fill_api_key_usage(&app, &mut summary, &key, &cfg.island_platform, *expires);
@@ -155,7 +211,28 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
             }
         }
     }
+    if cfg.island_platform == "grok" && summary.quotas.is_empty() {
+        summary.quotas.push(Quota { key: "SuperGrok 剩余".into(), value: "—".into() });
+        if summary.message == "尚无额度数据" { summary.message = "等待 Grok 订阅额度查询".into(); }
+    }
+    if cfg.island_platform == "zcode" && cfg.island_kind == "auth" && summary.quotas.is_empty() {
+        summary.quotas.push(Quota { key: "BigModel 套餐剩余".into(), value: "—".into() });
+        if summary.message == "尚无额度数据" { summary.message = "等待 ZCode BigModel Key 额度查询".into(); }
+    }
     summary
+}
+
+#[cfg(test)]
+mod remaining_tests {
+    use super::*;
+
+    #[test]
+    fn grok_remaining_requires_real_used_percentage() {
+        assert_eq!(remaining_percent(Some(37.5)), Some("62.5%".into()));
+        assert_eq!(remaining_percent(Some(100.0)), Some("0%".into()));
+        assert_eq!(remaining_percent(None), None);
+        assert_eq!(remaining_percent(Some(f64::NAN)), None);
+    }
 }
 
 pub fn close(app: &tauri::AppHandle) {
@@ -292,7 +369,7 @@ mod tests {
     fn plan_detection_only_counts_5h_and_7d_windows() {
         let window = |key: &str| crate::quota::QuotaWindow {
             key: key.into(), window_name: "窗口".into(),
-            used_percent: None, amount_text: None, resets_at: None,
+            used_percent: None, amount_text: None, remaining_text: None, resets_at: None,
         };
         assert!(has_plan_windows(&[window("5h")]));
         assert!(has_plan_windows(&[window("月消费"), window("7d")]));

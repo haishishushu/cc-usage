@@ -13,7 +13,7 @@ import type { DockEdge, QuotaWindow } from "@/types"
  *
  * 三种形态（dockQuotaView 判定）：
  * - 真实窗口按水位画；
- * - `unlimited`：API Key 无套餐，两条满格蓝色轨道 = 不设套餐上限（2026-09-19 鼠鼠定版）；
+ * - `unlimited`：已确认没有 5h / 7d 窗口，两条满格彩虹色轨道；
  * - 未连接 / 查询失败只留空轨道，不着色不画满格，与真实耗尽（红满格）区分。
  */
 const LONG = 120
@@ -31,7 +31,7 @@ const RADIUS: Record<DockEdge, string> = {
 export function DockedIsland({
   edge,
   quotas,
-  /** API Key 无套餐：忽略 quotas，画两条满格蓝色轨道，表示无套餐上限 */
+  /** 已确认没有 5h / 7d 窗口：忽略其他额度窗口，画两条满格彩虹色轨道 */
   unlimited = false,
   /** 未连接 / 查询失败 / 来源不可用：只保留空轨道，不着色也不画成满格 */
   unavailable,
@@ -80,13 +80,14 @@ export function DockedIsland({
           <span className="island-refresh-shimmer" />
         </span>
       )}
-      {(unlimited ? [null, null] : quotas).map((q) => {
-        // unlimited：两条满格蓝色；真实窗口按水位着色；不可用强制 0（空轨道）
+      {(unlimited ? [null, null] : quotas).map((q, index) => {
+        // unlimited：两条满格彩虹色；真实窗口按水位着色；不可用强制 0（空轨道）
+        // 每条都带位置标识；脉冲序号变化时重复 key 会导致旧轨道残留。
         const pct = unlimited ? 100 : unavailable ? 0 : (q!.usedPercent ?? 0)
         const size = Math.round((INNER * pct) / 100)
         return (
           <div
-            key={`${q?.key ?? "unlimited"}:${pulseKey}`}
+            key={`${q?.key ?? "unlimited"}:${index}:${pulseKey}`}
             className={cn(
               "overflow-hidden rounded-[1.5px] bg-track",
               horizontal ? "flex flex-row" : "flex flex-col justify-end",
@@ -100,7 +101,8 @@ export function DockedIsland({
               <div
                 className={cn(
                   "rounded-[1.5px]",
-                  unlimited ? "bg-accent-blue" : quotaBarClass(pct),
+                  unlimited ? "dock-unlimited-rainbow" : quotaBarClass(pct),
+                  unlimited && !horizontal && "dock-unlimited-rainbow-vertical",
                   pulse && "dock-token-pulse",
                 )}
                 style={{

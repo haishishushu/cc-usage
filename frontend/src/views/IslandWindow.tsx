@@ -10,13 +10,14 @@ import { useSettings } from "@/lib/useSettings"
 import { useConnections } from "@/lib/useConnections"
 import { shouldRefreshConnection } from "@/lib/refreshScope"
 import { useApiUsage, useBalance, useCostEstimate, useQuota } from "@/lib/useQuota"
-import { toQuotaWindows } from "@/lib/quotaMap"
+import { formatQuotaCountdown, toQuotaWindows } from "@/lib/quotaMap"
 import { api, isTauri, listenEvent } from "@/lib/api"
 import { createWindowSizeSync } from "@/lib/windowSizeSync"
 import { authQuotaRows } from "@/lib/authQuotaRows"
 import { collapseExpandedView, snapIndicatorVisible } from "@/lib/islandViewState"
 import type { DockEdge, IslandMode, PlatformId } from "@/types"
-import { platformConfig, isFetchOnlyPlatform } from "@/lib/platforms"
+import { platformConfig, isFetchOnlyPlatform, platformSupports } from "@/lib/platforms"
+import { remainingDisplay } from "@/lib/remainingDisplay"
 import { useSourceMetrics } from "@/lib/useSourceMetrics"
 import { useCollectionStatus } from "@/lib/useCollectionStatus"
 import { dockPulseActive } from "@/lib/dockPulse"
@@ -132,14 +133,25 @@ export function IslandWindow() {
   // 连接（2026-09-19 鼠鼠定版）。仍不回退到本机账号或唯一候选。
   const active = islandActiveConnection(settings.island_connection_id, connections, islandPlatform)
   const islandKind = active?.kind ?? settings.island_kind
-  const queries = connectionQueries(active)
+  const localQuotaPlatform = (islandPlatform === "grok" || islandPlatform === "zcode") && islandKind === "auth"
+  const queries = localQuotaPlatform
+    ? { quota: null, balance: null, usage: null }
+    : connectionQueries(active)
   const quota = useQuota(queries.quota)
+  const grokLocalQuota = useQuota(null, "grok", islandPlatform === "grok" && islandKind === "auth")
+  const zcodeLocalQuota = useQuota(null, "zcode", islandPlatform === "zcode" && islandKind === "auth")
   const balance = useBalance(queries.balance)
   const officialApiUsage = useApiUsage(queries.usage)
   const localCost = useCostEstimate(islandPlatform, "today")
   useEffect(() => setQuotaNow(Date.now()), [islandPlatform])
   const sourceMetrics = useSourceMetrics(islandPlatform, "today", null, null, quotaNow)
   const nativeMonitor = isFetchOnlyPlatform(islandPlatform as PlatformId) && islandPlatform !== "grok"
+  const remainingPlatform = isFetchOnlyPlatform(islandPlatform as PlatformId)
+  const remainingQuota = islandPlatform === "grok" && islandKind === "auth" ? grokLocalQuota
+    : islandPlatform === "zcode" && islandKind === "auth" ? zcodeLocalQuota : null
+  const remaining = remainingPlatform
+    ? remainingDisplay(islandPlatform as PlatformId, islandKind, remainingQuota?.state ?? null)
+    : null
   const refreshing = useRef(false)
   // 刷新反馈动画的序号：任一入口触发刷新都递增，岛的三种形态据此重放动画
   const [refreshSerial, setRefreshSerial] = useState(0)
@@ -158,6 +170,8 @@ export function IslandWindow() {
       setRefreshSerial((value) => value + 1)
       setRefreshActive(true)
       const jobs: Array<Promise<unknown>> = [quota.refresh(), balance.refresh(), officialApiUsage.refresh()]
+      if (islandPlatform === "grok" && islandKind === "auth") jobs.push(grokLocalQuota.refresh())
+      if (islandPlatform === "zcode" && islandKind === "auth") jobs.push(zcodeLocalQuota.refresh())
       if (scanSessions) jobs.push(api.scanLocalSessions())
       void Promise.all(jobs).catch(console.error).finally(() => { refreshing.current = false; setRefreshActive(false) })
     }
@@ -169,18 +183,19 @@ export function IslandWindow() {
       if (shouldRefreshConnection(connectionId, active?.id)) refreshNetwork(false)
     }))
     return () => { disposed = true; offs.forEach((off) => off()) }
-  }, [active?.id, islandPlatform, quota.refresh, balance.refresh, officialApiUsage.refresh])
+  }, [active?.id, islandPlatform, islandKind, queries.quota, quota.refresh, grokLocalQuota.refresh, zcodeLocalQuota.refresh, balance.refresh, officialApiUsage.refresh])
+  const displayQuota = remainingQuota ?? quota
   const quotaWindows =
-    quota.state?.state === "ok" ? toQuotaWindows(quota.state.windows, quotaNow) : null
+    displayQuota.state?.state === "ok" ? toQuotaWindows(displayQuota.state.windows, quotaNow) : null
 
-  // 停靠条的额度形态：真实窗口 / API Key 无套餐满格蓝 / 未知空轨道（§2.1.3）。
+  // 停靠条的额度形态：5h/7d 真实窗口 / 已确认无双窗口的彩虹双轨 / 未知空轨道。
   // 岛卡片与停靠条共用同一份查询结果，判定收敛在 dockQuotaView 一处。
   const quotaView = dockQuotaView({
     kind: islandKind,
-    connected: Boolean(active && active.status !== "paused"),
-    quotaQueried: Boolean(queries.quota),
-    quotaLoading: quota.loading,
-    quotaState: quota.state?.state ?? null,
+    connected: localQuotaPlatform || Boolean(active && active.status !== "paused"),
+    quotaQueried: localQuotaPlatform || Boolean(queries.quota),
+    quotaLoading: displayQuota.loading,
+    quotaState: displayQuota.state?.state ?? null,
     windows: quotaWindows,
   })
   const dockQuotas = quotaView.type === "windows" ? authQuotaRows(quotaView.windows) : authQuotaRows(undefined)
@@ -196,9 +211,21 @@ export function IslandWindow() {
         platform: islandPlatform as PlatformId,
         platformName: platformConfig(islandPlatform as PlatformId).name,
         localMetrics: nativeMonitor ? { token: live.todayTokenText, credits: sourceMetrics.data?.credits?.toLocaleString("zh-CN", { maximumFractionDigits: 4 }) ?? null, message: "本机留存记录；上报积分不等于余额。" } : undefined,
+        remainingMetrics: remaining ? {
+          rows: remaining.rows.map((row) => ({ label: row.label, value: row.value, reset: formatQuotaCountdown(row.resetsAt, quotaNow) })),
+          message: remainingQuota?.stale ? "额度可能已过期，请刷新" : remaining.reason,
+          source: remaining.source,
+          updated: remainingQuota?.fetchedAt?.toLocaleTimeString("zh-CN", { hour12: false }) ?? null,
+          localToken: nativeMonitor ? live.todayTokenText : null,
+          localCredits: nativeMonitor && platformSupports(islandPlatform as PlatformId, "credits")
+            ? sourceMetrics.data?.credits?.toLocaleString("zh-CN", { maximumFractionDigits: 4 }) ?? null
+            : null,
+        } : undefined,
         kind: islandKind,
         // Auth 保持额度布局；未知值不回退成 API 用量。
-        quotas: quotaWindows ?? undefined,
+        quotas: islandKind === "auth" && islandPlatform === "codex" && quotaWindows
+          ? authQuotaRows(quotaWindows, "账号额度接口未返回该窗口")
+          : quotaWindows ?? undefined,
         quotaUnavailable: !quotaWindows,
         quotaMessage: active?.status === "paused" ? "连接已断开，请在设置中重新连接"
           : quota.stale ? "额度可能已过期，请刷新"
@@ -387,7 +414,7 @@ export function IslandWindow() {
             onDoubleClick={undock}
             className={edge === "top" || edge === "bottom" ? "dock-contract-horizontal" : "dock-contract-vertical"}
           >
-            {/* 查到额度画真实水位；API Key 无套餐画两条满格蓝（§2.1.3，2026-09-19 鼠鼠定版）；
+            {/* 查到 5h/7d 画真实水位；已确认没有这两个窗口时画两条满格彩虹色；
                 其余查不到的只留空轨道，不着色不满格。
                 浏览器预览仍用设计示例展示三档水位 */}
             <DockedIsland

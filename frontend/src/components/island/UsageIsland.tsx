@@ -24,6 +24,15 @@ export interface IslandData {
   /** 接入方式只有官方订阅（Auth，绿）与 API Key（API，蓝）两种。决定徽标颜色与文字 */
   kind: "auth" | "api"
   localMetrics?: { token: string | null; credits: string | null; message: string }
+  /** 非 Claude/Codex 平台：在线剩余额度与本机消耗分别展示。 */
+  remainingMetrics?: {
+    rows: { label: string; value: string; reset: string | null }[]
+    message: string
+    source: string
+    updated: string | null
+    localToken: string | null
+    localCredits: string | null
+  }
   /**
    * 额度数据不可用（未连接 / 查询失败 / 该来源不提供额度）。
    * Auth 仍保留额度布局与未知值，不回退到 API 指标。
@@ -123,7 +132,7 @@ export function IslandCollapsed({
 }) {
   // Auth 与 API 布局由接入类型决定，额度缺失保留空态。
   // 编程套餐（api 连接）现在也能返回额度窗口，有窗口就按额度布局显示。
-  const showQuotas = data.kind === "auth" || (data.quotas?.length ?? 0) > 0
+  const showQuotas = !data.remainingMetrics && (data.kind === "auth" || (data.quotas?.length ?? 0) > 0)
   const quotaRows = data.platform === "grok" ? data.quotas ?? [] : authQuotaRows(data.quotas)
   return (
     <Shell onDoubleClick={onExpand} refreshKey={refreshKey} refreshing={refreshing}>
@@ -152,6 +161,17 @@ export function IslandCollapsed({
               </div>
               <p className="text-[11px] text-text-tertiary">{data.unavailable.hint}</p>
             </div>
+          ) : data.remainingMetrics ? (
+            <>
+              {data.remainingMetrics.rows.length > 0
+                ? data.remainingMetrics.rows.slice(0, 2).map((row, index) => <MetricRow key={`${row.label}:${index}`} label={row.label} value={row.value} />)
+                : <MetricRow label="剩余额度" value={null} />}
+              {data.remainingMetrics.rows.length === 1 && data.remainingMetrics.rows[0].reset
+                ? <MetricRow label="重置倒计时" value={data.remainingMetrics.rows[0].reset} />
+                : data.remainingMetrics.rows.length < 2 && data.remainingMetrics.localToken
+                  ? <MetricRow label="本机今日 Token" value={data.remainingMetrics.localToken} />
+                  : null}
+            </>
           ) : data.localMetrics ? (
             <><MetricRow label="本机今日 Token" value={data.localMetrics.token} /><MetricRow label="今日上报积分" value={data.localMetrics.credits} /></>
           ) : showQuotas ? (
@@ -176,7 +196,8 @@ export function IslandCollapsed({
       {showQuotas && !data.localMetrics && data.quotaMessage && (
         <p className="w-full text-[10px] leading-relaxed text-text-tertiary">{data.quotaMessage}</p>
       )}
-      {!showQuotas && data.apiMessage && <p className="text-[10px] leading-relaxed text-text-tertiary">{data.apiMessage}</p>}
+      {data.remainingMetrics?.message && <p className="w-full text-[10px] leading-relaxed text-text-tertiary">{data.remainingMetrics.message}</p>}
+      {!showQuotas && !data.remainingMetrics && data.apiMessage && <p className="text-[10px] leading-relaxed text-text-tertiary">{data.apiMessage}</p>}
     </Shell>
   )
 }
@@ -243,7 +264,7 @@ export function IslandExpanded({
 }) {
   const sessionTotal = data.sessions?.length ?? 0
   // 展开态与收缩态使用同一套额度规则：有额度窗口（auth 或编程套餐）即按额度布局。
-  const showQuotas = data.kind === "auth" || (data.quotas?.length ?? 0) > 0
+  const showQuotas = !data.remainingMetrics && (data.kind === "auth" || (data.quotas?.length ?? 0) > 0)
   const quotaRows = data.platform === "grok" ? data.quotas ?? [] : authQuotaRows(data.quotas)
   return (
     <Shell onDoubleClick={onCollapse} minHeight={connectionMenuOpen ? 240 : undefined} refreshKey={refreshKey} refreshing={refreshing}>
@@ -267,7 +288,20 @@ export function IslandExpanded({
         </div>
       )}
 
-      {data.localMetrics ? (
+      {data.remainingMetrics ? (
+        <div className="flex w-full flex-col gap-2">
+          <p className="text-[11px] text-text-tertiary">额度来源：{data.remainingMetrics.source}{data.remainingMetrics.updated ? ` · 更新于 ${data.remainingMetrics.updated}` : ""}</p>
+          {data.remainingMetrics.rows.length > 0
+            ? data.remainingMetrics.rows.map((row, index) => <div key={`${row.label}:${index}`} className="flex flex-col gap-1">
+              <MetricRow label={row.label} value={row.value} />
+              {row.reset && <p className="text-right text-[10px] text-text-tertiary">重置倒计时 {row.reset}</p>}
+            </div>)
+            : <MetricRow label="剩余额度" value={null} />}
+          {data.remainingMetrics.message && <p className="text-[10px] leading-relaxed text-text-tertiary">{data.remainingMetrics.message}</p>}
+          {data.remainingMetrics.localToken && <MetricRow label="本机今日 Token" value={data.remainingMetrics.localToken} />}
+          {data.remainingMetrics.localCredits && <MetricRow label="今日上报积分（非余额）" value={data.remainingMetrics.localCredits} />}
+        </div>
+      ) : data.localMetrics ? (
         <div className="flex flex-col gap-2"><MetricRow label="本机今日 Token" value={data.localMetrics.token} /><MetricRow label="今日上报积分" value={data.localMetrics.credits} /><p className="text-[10px] text-text-tertiary">{data.localMetrics.message}</p></div>
       ) : showQuotas ? (
         <div className="flex w-full flex-col gap-2">
@@ -305,7 +339,7 @@ export function IslandExpanded({
         </>
       )}
 
-      {data.todayTokenText && (
+      {data.todayTokenText && !data.remainingMetrics && (
         <>
           <Divider />
           <MetricRow label="本地今日 Token" value={data.todayTokenText} />

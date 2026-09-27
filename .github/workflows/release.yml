@@ -112,6 +112,29 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --dir frontend install --frozen-lockfile
 
+      # 持续构建版的补丁号取工作流运行号，保证每次发布版本号都严格递增；
+      # 否则 latest.json 永远是 conf 里写死的版本，已安装的用户永远收不到更新。
+      # 打 tag 的正式版不改写，用 tauri.conf.json 里的版本号。
+      - name: 生成持续构建版本号
+        if: github.ref_type != 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const path = "backend/tauri.conf.json";
+            const conf = JSON.parse(fs.readFileSync(path, "utf8"));
+            const [major, minor] = conf.version.split(".");
+            const version = `${major}.${minor}.${process.env.GITHUB_RUN_NUMBER}`;
+            conf.version = version;
+            fs.writeFileSync(path, `${JSON.stringify(conf, null, 2)}\n`);
+            // Cargo.toml 与 conf 保持一致，避免两处版本号各说各话
+            const cargo = "backend/Cargo.toml";
+            const text = fs.readFileSync(cargo, "utf8");
+            fs.writeFileSync(cargo, text.replace(/^version = ".*"$/m, `version = "${version}"`));
+            console.log(`持续构建版本号：${version}`);
+          '
+
       - name: 构建并发布安装包
         uses: tauri-apps/tauri-action@v0
         env:
@@ -128,3 +151,44 @@ jobs:
           prerelease: ${{ github.ref_type != 'tag' }}
           assetNamePattern: ${{ matrix.assetNamePattern }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+  publish-manifest:
+    needs: publish
+    name: 发布更新清单到 Pages
+    runs-on: ubuntu-latest
+    # 全平台构建完 latest.json 才是完整的；任一平台失败就不发布，
+    # 避免把缺平台的清单推上去让那些用户收到半截更新。
+    if: success()
+    # 用 Pages 的 Actions 部署模式：不建分支、不往仓库提交任何东西，
+    # 与 cc-usage-website 仓库同一套模式。
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: 取回本次发布的 latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'continuous' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern latest.json \
+            --dir site
+          echo "发布的清单版本：$(node -p "require('./site/latest.json').version")"
+          echo "覆盖平台：$(node -p "Object.keys(require('./site/latest.json').platforms).join(', ')")"
+
+      - name: 上传 Pages 制品
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: 部署到 Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

@@ -28,6 +28,7 @@ mod proxy_config;
 mod quota;
 mod coding_plan;
 mod grok_quota;
+mod zcode_quota;
 mod settings;
 mod session_titles;
 mod watcher;
@@ -491,6 +492,19 @@ async fn local_grok_quota(force: bool) -> Result<quota::QuotaState, String> {
         grok_quota::local_grok_quota,
     ))
         .await.map_err(|e| e.to_string())
+}
+
+/// 查询本机 ZCode BigModel Coding Plan API Key 的套餐额度。
+#[tauri::command]
+async fn local_zcode_quota(force: bool) -> Result<quota::QuotaState, String> {
+    tauri::async_runtime::spawn_blocking(move || cached_query(
+        &QUOTA_CACHE,
+        "local-zcode".into(),
+        force,
+        quota_cache_outcome,
+        zcode_quota::local_zcode_quota,
+    ))
+        .await.map_err(|error| error.to_string())
 }
 
 /// 套餐查询辅助凭证的掩码视图（智谱团队组织/项目 ID、火山 AK/SK）。
@@ -1475,8 +1489,8 @@ struct ConnectionTest {
 }
 
 /// 检测连接可用性（画布 18 后续，对齐 cc-switch 的检测按钮）：
-/// 用保存的凭证对上游做一次轻量验证并计时。不落库、不更新任何状态，
-/// 失败也只如实报告——检测不该有副作用。
+/// 用保存的凭证对上游做一次轻量验证并计时。成功时记录最近同步时间，
+/// 失败只如实报告，不把失败检测写成成功同步。
 #[tauri::command]
 async fn test_connection(app: tauri::AppHandle, db: State<'_, Db>, id: String) -> Result<ConnectionTest, String> {
     let Some(current) = with_database(db.0.clone(), {
@@ -1487,26 +1501,29 @@ async fn test_connection(app: tauri::AppHandle, db: State<'_, Db>, id: String) -
     else {
         return Err("连接不存在".into());
     };
-    if platforms::native(&current.platform) && current.kind == "auth" {
-        return Ok(match native_sources::check(&id,&current.platform) {
+    let result = if platforms::native(&current.platform) && current.kind == "auth" {
+        match native_sources::check(&id,&current.platform) {
             Ok(source)=>ConnectionTest {ok:true,latency_ms:0,message:Some(format!("{} 本机来源可读；未验证线上账号或余额",source.name))},
             Err(reason)=>ConnectionTest {ok:false,latency_ms:0,message:Some(reason)},
-        });
-    }
-    let secret = current.secret.clone().ok_or("该连接没有保存凭证，无法检测")?;
-    let plan = app.state::<settings::PlanQueryStore>().get();
-    tauri::async_runtime::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let extras = coding_plan::PlanExtras::from_secrets(&plan);
-        let latency_ms = || started.elapsed().as_millis() as u64;
-        match quota::validate_connection(&current.platform, &current.kind, &secret, current.base_url.as_deref(), &extras) {
-            Ok(()) => ConnectionTest { ok: true, latency_ms: latency_ms(), message: None },
-            Err(reason) => ConnectionTest { ok: false, latency_ms: latency_ms(), message: Some(reason) },
         }
-    })
-    .await
-    .map_err(|e| e.to_string())
-    .map(Ok)?
+    } else {
+        let secret = current.secret.clone().ok_or("该连接没有保存凭证，无法检测")?;
+        let plan = app.state::<settings::PlanQueryStore>().get();
+        tauri::async_runtime::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let extras = coding_plan::PlanExtras::from_secrets(&plan);
+            let latency_ms = || started.elapsed().as_millis() as u64;
+            match quota::validate_connection(&current.platform, &current.kind, &secret, current.base_url.as_deref(), &extras) {
+                Ok(()) => ConnectionTest { ok: true, latency_ms: latency_ms(), message: None },
+                Err(reason) => ConnectionTest { ok: false, latency_ms: latency_ms(), message: Some(reason) },
+            }
+        }).await.map_err(|e| e.to_string())?
+    };
+    if result.ok {
+        with_database(db.0.clone(), move |conn| connections::record_query_status(conn, &id, true)).await?;
+        let _ = app.emit("connections-changed", ());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2019,6 +2036,7 @@ mod tray_icon_tests {
                 window_name: format!("窗口 {index}"),
                 used_percent: *used_percent,
                 amount_text: None,
+                remaining_text: None,
                 resets_at: None,
             }).collect(),
             plan: None,
@@ -2185,6 +2203,7 @@ pub fn run() {
             connection_api_usage,
             local_codex_quota,
             local_grok_quota,
+            local_zcode_quota,
             get_plan_query_status,
             set_plan_query,
             connection_balance,
@@ -2211,10 +2230,12 @@ pub fn run() {
             take_main_intent,
             fetch_remote_models,
             updater::check_app_update_available,
-            updater::install_update_and_restart
+            updater::download_app_update,
+            updater::install_downloaded_update_and_restart
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            app.manage(updater::UpdateDownloadState::default());
 
             // SQLite 放在应用数据目录，对应设置里只读显示的「数据库位置」
             let data_dir = data_paths(&handle).map_err(std::io::Error::other)?.0;

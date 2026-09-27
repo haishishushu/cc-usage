@@ -66,6 +66,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgxMTgxMDg4ODA2RjMwRTYKUldUbU1HK0FpQkFZZ1JZWTdNVlQvcnh5SjB6UTkrZngzd2orS0diR1ZOVllLRFpFOE5WTlhmNVEK",
       "endpoints": [
+        "https://haishishushu.github.io/cc-usage/latest.json",
         "https://github.com/haishishushu/cc-usage/releases/latest/download/latest.json"
       ],
       "windows": {
