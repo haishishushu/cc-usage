@@ -142,13 +142,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: ${{ github.ref_type == 'tag' && 'v__VERSION__' || 'continuous' }}
-          releaseName: ${{ github.ref_type == 'tag' && 'CC Usage v__VERSION__' || 'CC Usage 持续构建版' }}
+          releaseName: CC Usage v__VERSION__
           releaseBody: |
             请在下方选择适合当前系统的安装包。
 
             `continuous` 为 main 分支每次提交后自动更新的持续构建版；`v*` 标签为正式稳定版。
           releaseDraft: false
-          prerelease: ${{ github.ref_type != 'tag' }}
+          # 持续构建版也标为正式发布：GitHub 的「最新发行版」徽章只认非预发布，
+          # 标成预发布的话徽章会一直留在旧的 v* 标签上误导访客，
+          # 而且回退端点 releases/latest 会跟着指向旧版本，向用户谎报「已是最新」。
+          prerelease: false
           assetNamePattern: ${{ matrix.assetNamePattern }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
