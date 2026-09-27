@@ -165,7 +165,8 @@ jobs:
     # 用 Pages 的 Actions 部署模式：不建分支、不往仓库提交任何东西，
     # 与 cc-usage-website 仓库同一套模式。
     permissions:
-      contents: read
+      # contents 需要写权限：下面要把发行版的标题与预发布标记同步成当前版本
+      contents: write
       pages: write
       id-token: write
     environment:
@@ -186,6 +187,25 @@ jobs:
             --dir site
           echo "发布的清单版本：$(node -p "require('./site/latest.json').version")"
           echo "覆盖平台：$(node -p "Object.keys(require('./site/latest.json').platforms).join(', ')")"
+
+      # tauri-action 只在「创建」发行版时写标题与预发布标记，复用同一个
+      # continuous 标签时不会更新它们，所以这里每次构建后显式同步一次：
+      # 标题带上真实版本号，并标成正式发布，让「最新发行版」徽章与
+      # releases/latest 回退端点都指向本次构建。
+      - name: 同步发行版元数据
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'continuous' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./site/latest.json').version")
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CC Usage v${VERSION}" \
+            --prerelease=false \
+            --latest
+          echo "已将 $TAG 标记为最新发行版：CC Usage v${VERSION}"
 
       - name: 上传 Pages 制品
         uses: actions/upload-pages-artifact@v3
