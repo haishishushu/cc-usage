@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useRef, useState, useSyncExternalStore } from "react"
 import { api, isTauri, listenEvent, type AppSettings } from "./api"
 
 /**
@@ -34,55 +34,78 @@ const DEFAULTS: AppSettings = {
   proxy_codex_upstream: null,
 }
 
+interface SharedSettings {
+  settings: AppSettings
+  ready: boolean
+  loading: boolean
+  error: string | null
+}
+
+/**
+ * 每个窗口只保留一份设置快照：额度、余额、用量等 hook 都要读刷新间隔，
+ * 各自读取和监听会让一个灵动岛窗口同时挂着六七份相同的订阅与初始请求。
+ */
+let shared: SharedSettings = { settings: DEFAULTS, ready: !isTauri, loading: isTauri, error: null }
+/** 每收到一次推送递增；读取或保存期间若有更新的推送，较旧的响应不能覆盖它。 */
+let revision = 0
+let subscribed = false
+const listeners = new Set<() => void>()
+
+function publish(patch: Partial<SharedSettings>) {
+  shared = { ...shared, ...patch }
+  listeners.forEach((listener) => listener())
+}
+
+async function reloadShared() {
+  if (!isTauri) return
+  const started = revision
+  publish({ loading: true })
+  try {
+    const next = await api.getSettings()
+    if (revision === started) publish({ settings: next, error: null, ready: true })
+  } catch (reason) { publish({ error: `设置读取失败：${String(reason)}` }) }
+  finally { publish({ loading: false }) }
+}
+
+function ensureSubscribed() {
+  if (subscribed || !isTauri) return
+  subscribed = true
+  // 先订阅再读初值；读取期间收到的新快照不能被较旧的响应覆盖。
+  void listenEvent<AppSettings>("settings-changed", (next) => {
+    revision++
+    publish({ settings: next, ready: true })
+  }).then(() => reloadShared()).catch((reason) => {
+    subscribed = false
+    publish({ error: `设置同步失败：${String(reason)}`, loading: false })
+  })
+}
+
+function subscribe(listener: () => void) {
+  ensureSubscribed()
+  listeners.add(listener)
+  return () => { listeners.delete(listener) }
+}
+
+const snapshot = () => shared
+
 export function useSettings() {
-  const [settings, setSettings] = useState<AppSettings>(DEFAULTS)
-  const [loading, setLoading] = useState(isTauri)
-  const [ready, setReady] = useState(!isTauri)
+  const state = useSyncExternalStore(subscribe, snapshot)
   const [saving, setSaving] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const busy = useRef(false)
-  const revision = useRef(0)
-
-  const reload = useCallback(async () => {
-    if (!isTauri) return
-    const started = revision.current
-    setLoading(true)
-    try {
-      const next = await api.getSettings()
-      if (revision.current === started) { setSettings(next); setError(null); setReady(true) }
-    } catch (reason) { setError(`设置读取失败：${String(reason)}`) }
-    finally { setLoading(false) }
-  }, [])
-
-  useEffect(() => {
-    if (!isTauri) return
-    let stopped = false
-    let off: (() => void) | undefined
-    // 先订阅再读初值；读取期间收到的新快照不能被较旧的响应覆盖。
-    void listenEvent<AppSettings>("settings-changed", (next) => {
-      if (!stopped) { revision.current++; setSettings(next); setReady(true) }
-    }).then(async (unsubscribe) => {
-      if (stopped) { unsubscribe(); return }
-      off = unsubscribe
-      await reload()
-    }).catch((reason) => {
-      if (!stopped) { setError(`设置同步失败：${String(reason)}`); setLoading(false) }
-    })
-    return () => { stopped = true; off?.() }
-  }, [reload])
 
   const save = useCallback(async (action: () => Promise<AppSettings>) => {
     if (busy.current) return false
     busy.current = true
     setSaving(true)
-    setError(null)
-    const started = revision.current
+    setSaveError(null)
+    const started = revision
     try {
       const next = await action()
-      if (revision.current === started) setSettings(next)
+      if (revision === started) publish({ settings: next })
       return true
     } catch (reason) {
-      setError(`设置保存失败：${String(reason)}`)
+      setSaveError(`设置保存失败：${String(reason)}`)
       return false
     } finally { busy.current = false; setSaving(false) }
   }, [])
@@ -105,6 +128,8 @@ export function useSettings() {
     return api.setDisplayPreferences(next.island_opacity, next.island_scale, next.island_shrink_scale, next.refresh_minutes)
   }), [save])
 
-  return { settings, ready, loading, saving, error, reload, setIslandPlatform, setIslandConnection, setIslandSource, setDnd, setDockEnabled, setTopmost, setSilentStartup, setProxy, setTheme, setRetentionDays, setDisplayPreferences }
+  const { settings, ready, loading } = state
+  const error = saveError ?? state.error
+  return { settings, ready, loading, saving, error, reload: reloadShared, setIslandPlatform, setIslandConnection, setIslandSource, setDnd, setDockEnabled, setTopmost, setSilentStartup, setProxy, setTheme, setRetentionDays, setDisplayPreferences }
 }
 

@@ -12,9 +12,21 @@ import {
   type ApiUsageStateDto,
   type CostEstimateDto,
   type CustomRange,
+  type Freshness,
   type QuotaStateDto,
-  type LiveUsageDto,
 } from "./api"
+import { onUsageChanged } from "./usageChanges"
+
+/**
+ * 定时刷新的新鲜度：后端缓存比刷新间隔略新就复用。灵动岛、总览与设置预览各自按间隔轮询
+ * 同一连接时，同一周期只打一次上游；留 15 秒余量，避免缓存从请求完成才计时而把间隔拖长一轮。
+ */
+function periodic(interval: number): Freshness {
+  return { maxAgeMs: Math.max(interval - 15_000, 0) }
+}
+
+/** 额度窗口重置后的补查：各窗口的计时同时到期，只要重置之后取得的结果即可共用。 */
+const AFTER_RESET: Freshness = { maxAgeMs: 1_000 }
 
 /**
  * 额度与余额查询（§2.5 / §7.4）
@@ -60,7 +72,7 @@ export function useQuota(connectionId: string | null, local: boolean | "grok" | 
   const [stale, setStale] = useState(false)
   const [failure, setFailure] = useState<Exclude<QuotaStateDto, { state: "ok" }> | null>(null)
 
-  const run = useCallback(async (force = false) => {
+  const run = useCallback(async (force: Freshness = false) => {
     if (!isTauri || (!connectionId && !local)) return
     const current = ++requestId.current
     setLoading(true)
@@ -121,7 +133,7 @@ export function useQuota(connectionId: string | null, local: boolean | "grok" | 
   useEffect(() => {
     if (!enabled || !isTauri || (!connectionId && !local)) { setLoading(false); return }
     void run(false)
-    const timer = window.setInterval(() => void run(true), interval)
+    const timer = window.setInterval(() => void run(periodic(interval)), interval)
     return () => { ++requestId.current; window.clearInterval(timer) }
   }, [run, local, connectionId, interval, enabled])
 
@@ -134,7 +146,7 @@ export function useQuota(connectionId: string | null, local: boolean | "grok" | 
       .sort((a, b) => a - b)[0]
     if (!nextReset) return
     const timer = window.setTimeout(
-      () => { void run(true) },
+      () => { void run(AFTER_RESET) },
       Math.min(nextReset - now + 1_000, 2_147_000_000),
     )
     return () => window.clearTimeout(timer)
@@ -170,7 +182,7 @@ export function useBalance(connectionId: string | null, enabled = true): Balance
   const [stale, setStale] = useState(false)
   const [failure, setFailure] = useState<Exclude<BalanceStateDto, { state: "ok" }> | null>(null)
 
-  const run = useCallback(async (force = false) => {
+  const run = useCallback(async (force: Freshness = false) => {
     if (!isTauri || !connectionId) return
     const current = ++requestId.current
     setLoading(true)
@@ -227,7 +239,7 @@ export function useBalance(connectionId: string | null, enabled = true): Balance
   useEffect(() => {
     if (!enabled || !isTauri || !connectionId) { setLoading(false); return }
     void run(false)
-    const timer = window.setInterval(() => void run(true), interval)
+    const timer = window.setInterval(() => void run(periodic(interval)), interval)
     return () => { ++requestId.current; window.clearInterval(timer) }
   }, [run, connectionId, interval, enabled])
 
@@ -253,7 +265,7 @@ export function useApiUsage(connectionId: string | null, enabled = true): ApiUsa
   const [loading, setLoading] = useState(false)
   const [fetchedAt, setFetchedAt] = useState<Date | null>(null)
 
-  const run = useCallback(async (force = false) => {
+  const run = useCallback(async (force: Freshness = false) => {
     if (!isTauri || !connectionId) return
     const current = ++requestId.current
     setLoading(true)
@@ -280,7 +292,7 @@ export function useApiUsage(connectionId: string | null, enabled = true): ApiUsa
   useEffect(() => {
     if (!enabled || !isTauri || !connectionId) { setLoading(false); return }
     void run(false)
-    const timer = window.setInterval(() => void run(true), interval)
+    const timer = window.setInterval(() => void run(periodic(interval)), interval)
     return () => { ++requestId.current; window.clearInterval(timer) }
   }, [run, connectionId, interval, enabled])
 
@@ -292,6 +304,7 @@ export function useApiUsage(connectionId: string | null, enabled = true): ApiUsa
 /**
  * 区间估算费用（§2.4）。
  * 本地记录不含账单金额，因此这里拿到的**永远是估算值**，界面必须标注「估算」。
+ * `enabled` 为 false 时（窗口隐藏、停靠未探出）保留已有值、不订阅也不查询；恢复后补查一次。
  */
 export function useCostEstimate(
   platform: string,
@@ -299,6 +312,7 @@ export function useCostEstimate(
   custom?: CustomRange | null,
   queryEndMs?: number,
   model?: string | null,
+  enabled = true,
 ) {
   const [data, setData] = useState<CostEstimateDto | null>(null)
   const owner = useRef<string | null>(null)
@@ -307,7 +321,7 @@ export function useCostEstimate(
     const query = JSON.stringify([platform, period, custom?.start, custom?.end, model])
     if (owner.current !== query) setData(null)
     owner.current = query
-    if (!isTauri || (period === "custom" && !custom)) return
+    if (!enabled || !isTauri || (period === "custom" && !custom)) return
     let cancelled = false
     let serial = 0
     const offs: Array<() => void> = []
@@ -320,7 +334,8 @@ export function useCostEstimate(
     const listen = (promise: Promise<() => void>) => void promise.then(off => { if (cancelled) off(); else offs.push(off) }).catch(() => {})
     refresh()
     if (queryEndMs == null) {
-      listen(listenEvent<LiveUsageDto>("live-usage", usage => { if (usage.platform === platform) refresh() }))
+      // 只有本平台统计真有变化才重查，连续变化合并；续期心跳不触发。
+      offs.push(onUsageChanged(platform, refresh))
       // 带连接 ID 的行内更新不影响费用汇总；只有全局刷新才重查。
       listen(listenEvent<string | null>("refresh-requested", connectionId => { if (connectionId == null) refresh() }))
     }
@@ -328,7 +343,7 @@ export function useCostEstimate(
       cancelled = true
       offs.forEach(off => off())
     }
-  }, [platform, period, custom, queryEndMs, model])
+  }, [platform, period, custom, queryEndMs, model, enabled])
 
   return data
 }

@@ -1,8 +1,12 @@
 //! 按需创建的只读托盘摘要；不获取焦点、不穿插额外网络请求。
+//! 离开图标后窗口先隐藏保温，短时间内再次悬停直接复用，闲置一段时间才销毁，
+//! 避免每次悬停都重建一个 WebView2。
 use std::sync::{Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
-use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 
 const LABEL: &str = "tray-summary";
+/// 隐藏后保温多久再销毁。
+const KEEP_WARM: std::time::Duration = std::time::Duration::from_secs(60);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static ANCHOR: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// 光标当前是否仍在托盘图标上。建窗在主线程异步完成，离开可能落在
@@ -93,23 +97,22 @@ fn fill_api_key_usage(
     let mut latest = quota_expires;
     let org_usage = crate::API_USAGE_CACHE.state.lock().ok()
         .and_then(|cache| {
-            cache.entries.get(key).and_then(|(value, expires, _)| match value {
+            cache.entries.get(key).and_then(|(value, expires, _, _)| match value {
                 crate::quota::ApiUsageState::Ok { total_tokens, .. } => Some((thousands(*total_tokens), *expires)),
                 _ => None,
             })
         });
     let today_text = match org_usage {
         Some((text, expires)) => { if expires > latest { latest = expires; } format!("{text} Token") }
-        None => app.try_state::<crate::Db>().and_then(|db| {
-            let conn = db.0.lock().ok()?;
-            crate::db::today_fresh_tokens(&conn, platform).ok().flatten()
+        None => app.try_state::<crate::DbRead>().and_then(|db| {
+            db.0.with(|conn| crate::db::today_fresh_tokens(conn, platform).ok().flatten())
         }).map_or_else(|| "—".into(), |tokens| format!("{} Token", thousands(tokens.max(0) as u64))),
     };
     summary.quotas.push(Quota { key: "今日Token".into(), value: today_text });
 
     let balance = crate::BALANCE_CACHE.state.lock().ok()
         .and_then(|cache| {
-            cache.entries.get(key).and_then(|(value, expires, _)| match value {
+            cache.entries.get(key).and_then(|(value, expires, _, _)| match value {
                 crate::quota::BalanceState::Ok { balance, currency, .. } => Some((format!("{balance:.2} {currency}"), *expires)),
                 _ => None,
             })
@@ -125,8 +128,13 @@ fn fill_api_key_usage(
     summary.message = String::new();
 }
 
+/// 异步命令：同步命令在主线程执行，读库时会卡住所有窗口。
 #[tauri::command]
-pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
+pub async fn tray_summary_get(app: tauri::AppHandle) -> Result<Summary, String> {
+    tauri::async_runtime::spawn_blocking(move || summary(&app)).await.map_err(|e| e.to_string())
+}
+
+fn summary(app: &tauri::AppHandle) -> Summary {
     let cfg = app.state::<crate::Cfg>().0.get();
     let platform = crate::platform_name(&cfg.island_platform);
     let kind = if cfg.island_kind == "auth" { "Auth" } else { "API Key" };
@@ -149,7 +157,7 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
     }
     if let Some(key) = cache_key(&cfg) {
         if let Ok(cache) = crate::QUOTA_CACHE.state.lock() {
-            if let Some((state, expires, _)) = cache.entries.get(&key) {
+            if let Some((state, expires, _, _)) = cache.entries.get(&key) {
                 match state {
                     crate::quota::QuotaState::Ok { windows, .. } => {
                         if cfg.island_platform == "grok" {
@@ -177,7 +185,7 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
                         // API Key 且确认无 5h/7d 套餐窗口：改显「今日Token + 剩余金额」
                         //（2026-09-19 鼠鼠定版）。查询失败/凭证失效不算无套餐，仍按原样说明原因。
                         if cfg.island_kind == "api" && !has_plan_windows(windows) {
-                            fill_api_key_usage(&app, &mut summary, &key, &cfg.island_platform, *expires);
+                            fill_api_key_usage(app, &mut summary, &key, &cfg.island_platform, *expires);
                         } else {
                             summary.quotas = windows.iter().map(|window| Quota {
                                 key: window.key.clone(),
@@ -200,7 +208,7 @@ pub fn tray_summary_get(app: tauri::AppHandle) -> Summary {
                     }
                     crate::quota::QuotaState::Unsupported { .. } if cfg.island_kind == "api" => {
                         // 明确不提供订阅额度 = API Key 无套餐的确定性结论
-                        fill_api_key_usage(&app, &mut summary, &key, &cfg.island_platform, *expires);
+                        fill_api_key_usage(app, &mut summary, &key, &cfg.island_platform, *expires);
                     }
                     crate::quota::QuotaState::Unsupported { .. } => summary.message = "此连接不提供订阅额度".into(),
                     crate::quota::QuotaState::Unauthorized { .. } => summary.message = "凭证已失效，请重新授权".into(),
@@ -237,8 +245,28 @@ mod remaining_tests {
 
 pub fn close(app: &tauri::AppHandle) {
     HOVERING.store(false, Ordering::SeqCst);
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    if let Some(window) = app.get_webview_window(LABEL) { let _ = window.destroy(); }
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    park(app, generation);
+}
+
+/// 隐藏摘要并在保温期后销毁；`generation` 之后若有新的悬停或关闭，本次销毁作废。
+fn park(app: &tauri::AppHandle, generation: u64) {
+    let Some(window) = app.get_webview_window(LABEL) else { return };
+    let _ = window.hide();
+    // 广播即可：只有摘要页监听这两个事件名
+    let _ = app.emit("tray-summary-close", ());
+    // 保温期内没有新的悬停才销毁；期间任何 enter / close 都会换代，旧计时作废。
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(KEEP_WARM);
+        if GENERATION.load(Ordering::SeqCst) != generation { return; }
+        let app = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if GENERATION.load(Ordering::SeqCst) == generation && !HOVERING.load(Ordering::SeqCst) {
+                if let Some(window) = app.get_webview_window(LABEL) { let _ = window.destroy(); }
+            }
+        });
+    });
 }
 
 /// 光标离锚点多远就判定为已离开图标（物理像素）。
@@ -258,16 +286,24 @@ pub fn enter(app: &tauri::AppHandle, x: f64, y: f64) {
         std::thread::sleep(std::time::Duration::from_millis(350));
         let app = handle.clone();
         let _ = handle.run_on_main_thread(move || {
-            if GENERATION.load(Ordering::SeqCst) != generation || app.get_webview_window(LABEL).is_some() { return; }
+            if GENERATION.load(Ordering::SeqCst) != generation { return; }
+            if app.get_webview_window(LABEL).is_some() {
+                // 保温中的窗口：通知页面重读摘要并按内容尺寸重新定位、显示。
+                let _ = app.emit("tray-summary-open", ());
+                return;
+            }
             match WebviewWindowBuilder::new(&app, LABEL, WebviewUrl::App("index.html?window=tray-summary".into()))
                 .title("CC Usage Summary").inner_size(254.0, 150.0)
                 .decorations(false).transparent(true).shadow(false).resizable(false)
                 .skip_taskbar(true).always_on_top(true).visible(false).focused(false).focusable(false)
                 .build() {
                 Ok(window) => {
-                    // 建窗期间可能已收到离开事件，而当时窗口尚未注册、销毁扑空。
-                    // 建成后立刻复查代数，过期就当场销毁，不留隐藏孤儿窗口。
-                    if GENERATION.load(Ordering::SeqCst) != generation { let _ = window.destroy(); }
+                    // 建窗期间可能已收到离开事件，而当时窗口尚未注册、关闭扑空。
+                    // 建成后立刻复查代数，过期就走正常关闭流程（隐藏保温、到期销毁），不留孤儿窗口。
+                    // 若期间已重新悬停，新一轮 enter 会复用这个窗口，这里不能作废它。
+                    if GENERATION.load(Ordering::SeqCst) != generation {
+                        if !HOVERING.load(Ordering::SeqCst) { park(&app, GENERATION.load(Ordering::SeqCst)); }
+                    }
                     else { let _ = window.set_ignore_cursor_events(true); }
                 }
                 Err(error) => eprintln!("[托盘摘要] {error}"),
@@ -310,8 +346,8 @@ pub fn tray_summary_fit(app: tauri::AppHandle, width: f64, height: f64) -> Resul
     if !width.is_finite() || !height.is_finite() || !(230.0..=300.0).contains(&width) || !(50.0..=800.0).contains(&height) { return Err("摘要尺寸无效".into()); }
     let window = app.get_webview_window(LABEL).ok_or("摘要已关闭")?;
     if !HOVERING.load(Ordering::SeqCst) {
-        // 窗口建成时光标已离开托盘图标：摘要此时绝不能弹出，销毁迟到窗口。
-        let _ = window.destroy();
+        // 光标已离开托盘图标：摘要此时绝不能弹出，保持隐藏，由保温计时负责销毁。
+        let _ = window.hide();
         return Err("摘要已关闭".into());
     }
     let (x, y) = ANCHOR.lock().map_err(|e| e.to_string())?.ok_or("缺少摘要位置")?;

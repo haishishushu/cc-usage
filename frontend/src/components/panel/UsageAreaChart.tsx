@@ -1,4 +1,4 @@
-import { useId, useRef, useState } from "react"
+import { useId, useMemo, useRef, useState } from "react"
 import { cn } from "@/lib/utils"
 import { compactTokens, grouped } from "@/lib/api"
 import {
@@ -29,6 +29,10 @@ const COST_PLOT_HEIGHT = 56
 const Y_AXIS_WIDTH = 52
 /** 两格之间的空档：量纲不同，刻度贴太近会被读成同一根轴上的连续刻度 */
 const COST_GAP = 22
+// 绘图区宽度靠布局决定，SVG 用 viewBox 缩放；这里的 1000 只是坐标系单位
+const VIEW_WIDTH = 1000
+const TOKEN_PLOT = { width: VIEW_WIDTH, height: TOKEN_PLOT_HEIGHT }
+const COST_PLOT = { width: VIEW_WIDTH, height: COST_PLOT_HEIGHT }
 
 /** 费用文案：极小额显示为 <$0.0001，避免四舍五入成 $0.0000 让人以为免费 */
 function costText(value: number): string {
@@ -53,8 +57,6 @@ export function UsageAreaChart({
   // 被隐藏的系列。缓存命中常比其余三条大一个数量级，全开时那三条会压在底边成一条直线；
   // 关掉主导系列后纵轴按剩下的重新缩放，小量级的变化才看得出来。
   const [hidden, setHidden] = useState<Set<string>>(() => new Set())
-  // 绘图区宽度靠布局决定，SVG 用 viewBox 缩放；这里的 1000 只是坐标系单位
-  const VIEW_WIDTH = 1000
 
   const toggle = (key: string) =>
     setHidden((current) => {
@@ -65,15 +67,22 @@ export function UsageAreaChart({
       return next
     })
 
-  const visible = series.filter((item) => !hidden.has(item.key))
+  const visible = useMemo(() => series.filter((item) => !hidden.has(item.key)), [series, hidden])
   const tokenTop = niceCeil(seriesMax(visible))
   const tokenTicks = axisTicks(tokenTop)
   const costValues = cost.filter((value): value is number => value !== null)
   const costTop = niceCeil(costValues.length ? Math.max(...costValues) : 0)
   const every = labelEvery(labels.length)
-
-  const tokenPlot = { width: VIEW_WIDTH, height: TOKEN_PLOT_HEIGHT }
-  const costPlot = { width: VIEW_WIDTH, height: COST_PLOT_HEIGHT }
+  // 悬停只移动指示线：路径只在数据、可见系列或纵轴上限变化时重算
+  const tokenPaths = useMemo(() => visible.map((item) => ({
+    item,
+    area: areaPath(item.values, tokenTop, TOKEN_PLOT),
+    line: linePath(item.values, tokenTop, TOKEN_PLOT),
+  })), [visible, tokenTop])
+  const costPaths = useMemo(() => ({
+    area: areaPath(cost, costTop, COST_PLOT),
+    line: linePath(cost, costTop, COST_PLOT),
+  }), [cost, costTop])
 
   const track = (event: React.MouseEvent<HTMLDivElement>) => {
     const box = plotRef.current?.getBoundingClientRect()
@@ -190,17 +199,17 @@ export function UsageAreaChart({
                 )
               })}
 
-              {visible.map((item) => (
+              {tokenPaths.map(({ item, area }) => (
                 <path
                   key={`${item.key}-area`}
-                  d={areaPath(item.values, tokenTop, tokenPlot)}
+                  d={area}
                   fill={`url(#${gradientId}-${item.key})`}
                 />
               ))}
-              {visible.map((item) => (
+              {tokenPaths.map(({ item, line }) => (
                 <path
                   key={`${item.key}-line`}
-                  d={linePath(item.values, tokenTop, tokenPlot)}
+                  d={line}
                   fill="none"
                   stroke={`var(${item.colorVar})`}
                   strokeWidth={2}
@@ -238,12 +247,12 @@ export function UsageAreaChart({
                 vectorEffect="non-scaling-stroke"
               />
               <path
-                d={areaPath(cost, costTop, costPlot)}
+                d={costPaths.area}
                 fill="var(--chart-cost)"
                 fillOpacity={0.1}
               />
               <path
-                d={linePath(cost, costTop, costPlot)}
+                d={costPaths.line}
                 fill="none"
                 stroke="var(--chart-cost)"
                 strokeWidth={2}

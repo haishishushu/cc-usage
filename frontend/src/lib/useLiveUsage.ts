@@ -2,13 +2,18 @@
 import { api, compactTokens, isTauri, listenLiveUsage, type LiveUsageDto } from "./api"
 import { useRef } from "react"
 import { LiveTokenCounter } from "./liveTokenCounter"
+import { LiveCounts } from "./liveCounts"
 import type { DeltaPhase } from "@/components/island/TokenDelta"
 import type { SessionActivity } from "@/types"
 
 export interface LiveUsage {
-  deltaText: string | null
-  /** 已经插值的显示值，所有布局共用，不在展示组件中再次补间。 */
-  deltaTokens: number | null
+  /**
+   * 已经插值的逐帧显示值（`total` 与 `session:<id>`），所有布局共用、不在展示组件中再次补间。
+   * 放在 React 状态之外：通过 LiveCountsContext 交给显示数字的叶子组件订阅。
+   */
+  counts: LiveCounts
+  /** 追数合计当前是否大于 0（只在跨越 0 时变化，不随每帧变化） */
+  deltaPositive: boolean
   deltaPhase: DeltaPhase
   sessions: SessionActivity[]
   activityCountText: string | null
@@ -34,7 +39,8 @@ export function useConnectionKind(platform: string) {
 
 /** 日志事件驱动真实目标值；合计与各会话在同一个帧循环中追数。 */
 export function useLiveUsage(platform: string, enabled = true, dnd = false, paused = false): LiveUsage {
-  const [counts, setCounts] = useState<Record<string, number>>({})
+  const [counts] = useState(() => new LiveCounts())
+  const [deltaPositive, setDeltaPositive] = useState(false)
   const [phase, setPhase] = useState<DeltaPhase>("idle")
   const [sessions, setSessions] = useState<SessionActivity[]>([])
   const [today, setToday] = useState<number | null>(null)
@@ -50,7 +56,8 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
   }, [paused])
 
   useEffect(() => {
-    setCounts({})
+    counts.set({})
+    setDeltaPositive(false)
     setPhase("idle")
     setSessions([])
     setToday(null)
@@ -73,7 +80,9 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
       if (stopped) return
       if (pausedRef.current) return
       const snapshot = counter.sample(now, reducedMotion.matches)
-      setCounts(snapshot.values)
+      counts.set(snapshot.values)
+      // 只有跨越 0 时才更新 React 状态；同值 setState 不会触发重渲染。
+      setDeltaPositive((snapshot.values.total ?? 0) > 0)
       if (!snapshot.settled) frame = requestAnimationFrame(tick)
     }
     const animate = () => {
@@ -98,7 +107,8 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
           if (frame !== null) cancelAnimationFrame(frame)
           frame = null
           counter.clear()
-          setCounts({})
+          counts.set({})
+          setDeltaPositive(false)
           setPhase("idle")
           showing = false
         }, reducedMotion.matches ? 0 : 300)
@@ -170,6 +180,7 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
         id: session.session_id,
         title: session.title,
         deltaText: "—",
+        countKey: `session:${session.session_id}`,
         state: session.state !== "recent" ? session.state : "unknown",
         updatedAtMs: session.last_seen_ms,
         startedAtMs: session.started_at_ms ?? undefined,
@@ -206,17 +217,14 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
       reducedMotion.removeEventListener("change", animate)
       resumeRef.current = () => {}
     }
-  }, [platform, enabled, dnd])
+  }, [platform, enabled, dnd, counts])
 
-  const deltaTokens = counts.total ?? 0
   return {
-    deltaText: deltaTokens > 0 ? `+${compactTokens(deltaTokens)} Token` : null,
-    deltaTokens: phase === "idle" ? null : deltaTokens,
+    counts,
+    deltaPositive,
     deltaPhase: phase,
-    sessions: sessions.map((session) => {
-      const tokens = counts[`session:${session.id}`]
-      return { ...session, deltaText: tokens == null ? "—" : `+${compactTokens(tokens)} Token` }
-    }),
+    // 会话数组只在事件到达时换新引用，逐帧数值由各行按 countKey 自行订阅。
+    sessions,
     // 「运行中」只数 running 会话；失败会话单独提示，不混入运行数。
     activityCountText: (() => {
       if (sessions.length === 0) return null
@@ -233,4 +241,30 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
     pulseSerial,
     live,
   }
+}
+
+/**
+ * 只取「本机今日 Token」：不跑追数动画、不维护会话列表（连接预览卡片用）。
+ * `enabled` 为 false（面板隐藏）时停止订阅并保留已有值；切换平台才清空。
+ */
+export function useLiveToday(platform: string, enabled = true): string | null {
+  const [today, setToday] = useState<{ platform: string; tokens: number | null } | null>(null)
+  useEffect(() => {
+    if (!isTauri || !enabled) return
+    let stopped = false
+    let cursor: number | null = null
+    let unlisten: (() => void) | null = null
+    const apply = (usage: LiveUsageDto) => {
+      if (stopped || usage.platform !== platform || (cursor !== null && usage.cursor < cursor)) return
+      cursor = usage.cursor
+      setToday({ platform, tokens: usage.today_tokens })
+    }
+    void listenLiveUsage(apply).then((un) => {
+      if (stopped) { un(); return }
+      unlisten = un
+      void api.liveUsage(platform, null).then(apply).catch(() => {})
+    }).catch(() => {})
+    return () => { stopped = true; unlisten?.() }
+  }, [platform, enabled])
+  return today?.platform === platform && today.tokens !== null ? compactTokens(today.tokens) : null
 }

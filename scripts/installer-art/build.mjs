@@ -34,7 +34,7 @@ const SCALE = 2;
 
 function fontDataUrl(file) {
   const base64 = fs.readFileSync(path.join(fontDir, file)).toString("base64");
-  return `data:font/ttf;base64,${base64}`;
+  return `data:font/woff2;base64,${base64}`;
 }
 
 /**
@@ -171,8 +171,8 @@ console.log(`Chromium: ${chrome}`);
 const tokens = {
   productName: tauriConf.productName,
   version: tauriConf.version,
-  interFontUrl: fontDataUrl("Inter-Variable.ttf"),
-  monoFontUrl: fontDataUrl("JetBrainsMono-Variable.ttf"),
+  interFontUrl: fontDataUrl("Inter-Variable.woff2"),
+  monoFontUrl: fontDataUrl("JetBrainsMono-Variable.woff2"),
 };
 
 try {

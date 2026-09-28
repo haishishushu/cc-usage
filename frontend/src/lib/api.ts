@@ -7,10 +7,20 @@
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
 
-export const localCodexQuota = (force = false) => invoke<QuotaStateDto>("local_codex_quota", { force })
+/**
+ * 额度类查询的新鲜度：`true` 为用户显式刷新（跳过成功缓存）；`{ maxAgeMs }` 为定时刷新——
+ * 后端缓存不超过这么久就复用，多个窗口同一周期只打一次上游，又不会把刷新间隔拖长。
+ */
+export type Freshness = boolean | { maxAgeMs: number }
 
-export const localGrokQuota = (force = false) => invoke<QuotaStateDto>("local_grok_quota", { force })
-export const localZcodeQuota = (force = false) => invoke<QuotaStateDto>("local_zcode_quota", { force })
+export function freshnessArgs(value: Freshness): { force: boolean; maxAgeMs?: number } {
+  return typeof value === "boolean" ? { force: value } : { force: false, maxAgeMs: Math.max(0, Math.round(value.maxAgeMs)) }
+}
+
+export const localCodexQuota = (force: Freshness = false) => invoke<QuotaStateDto>("local_codex_quota", freshnessArgs(force))
+
+export const localGrokQuota = (force: Freshness = false) => invoke<QuotaStateDto>("local_grok_quota", freshnessArgs(force))
+export const localZcodeQuota = (force: Freshness = false) => invoke<QuotaStateDto>("local_zcode_quota", freshnessArgs(force))
 
 /** 套餐查询辅助凭证的掩码视图；凭证原值永不出后端 */
 export interface PlanQueryStatusDto {
@@ -136,6 +146,8 @@ export interface LiveUsageDto {
   today_tokens: number | null
   realtime_delta: boolean
   initial: boolean
+  /** 本平台统计自上次推送后有变化；仅续期运行中会话的心跳为 false，统计视图据此跳过重查 */
+  data_changed?: boolean
 }
 
 /** 接入方式只有官方订阅（Auth）与 API Key 两种 */
@@ -465,9 +477,9 @@ export const api = {
     model: string | null,
     queryEndMs: number,
   ) => invoke<LogPage>("request_log", { platform, period, page, custom, model, queryEndMs }),
-  connectionQuota: (id: string, force = false) => invoke<QuotaStateDto>("connection_quota", { id, force }),
-  connectionApiUsage: (id: string, force = false) => invoke<ApiUsageStateDto>("connection_api_usage", { id, force }),
-  connectionBalance: (id: string, force = false) => invoke<BalanceStateDto>("connection_balance", { id, force }),
+  connectionQuota: (id: string, force: Freshness = false) => invoke<QuotaStateDto>("connection_quota", { id, ...freshnessArgs(force) }),
+  connectionApiUsage: (id: string, force: Freshness = false) => invoke<ApiUsageStateDto>("connection_api_usage", { id, ...freshnessArgs(force) }),
+  connectionBalance: (id: string, force: Freshness = false) => invoke<BalanceStateDto>("connection_balance", { id, ...freshnessArgs(force) }),
   costEstimate: (
     platform: string,
     period: string,

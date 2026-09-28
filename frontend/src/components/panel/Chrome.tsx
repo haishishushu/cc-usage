@@ -74,7 +74,7 @@ export function TitleBar({ title = "CC Usage" }: { title?: string }) {
         await win.toggleMaximize()
         setMaximized(await win.isMaximized())
       } else {
-        // 关闭会销毁主面板 WebView；托盘、灵动岛与后台采集继续运行。
+        // 关闭只隐藏主面板（后端拦截关闭请求），托盘再次打开时秒开；灵动岛与后台采集继续运行。
         await win.close()
       }
     } catch {

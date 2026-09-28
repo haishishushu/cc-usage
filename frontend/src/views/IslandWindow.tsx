@@ -1,4 +1,3 @@
-import { IslandConnectionSwitcher } from "@/components/island/IslandConnectionSwitcher"
 import { IslandMotion } from "@/components/island/IslandMotion"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { IslandCollapsed, IslandExpanded, type IslandData } from "@/components/island/UsageIsland"
@@ -23,6 +22,9 @@ import { useCollectionStatus } from "@/lib/useCollectionStatus"
 import { dockPulseActive } from "@/lib/dockPulse"
 import { balanceSnapshotTime, connectionQueries, islandActiveConnection, islandConnectionStatus, islandCost } from "@/lib/islandPresentation"
 import { dockQuotaView } from "@/lib/dockQuotaView"
+import { LiveCountsContext } from "@/lib/liveCounts"
+import { onUsageChanged } from "@/lib/usageChanges"
+import { LazyConnectionSwitcher } from "@/components/island/LazyConnectionSwitcher"
 
 /** 平台展示名。未知平台原样显示，不臆测 */
 const PLATFORM_NAMES: Record<string, string> = {
@@ -118,7 +120,6 @@ export function IslandWindow() {
     return () => window.clearInterval(timer)
   }, [])
 
-  // 真实实时数据：停靠且未探出时暂停轮询（无可见提示区，省掉无谓渲染）
   // 灵动岛显示的平台由持久化设置决定，与托盘子菜单同一个值
   const { settings } = useSettings()
   const islandPlatform = settings.island_platform
@@ -137,15 +138,19 @@ export function IslandWindow() {
   const queries = localQuotaPlatform
     ? { quota: null, balance: null, usage: null }
     : connectionQueries(active)
+  // 停靠且未探出时，停靠条只画额度水位：额度照常轮询；余额、组织用量、本机费用与积分
+  // 只在卡片里显示，此时暂停查询，探出或展开时立即补查（定时刷新走后端缓存，不额外打上游）。
+  const cardsVisible = mode !== "docked" || peek
   const quota = useQuota(queries.quota)
   const grokLocalQuota = useQuota(null, "grok", islandPlatform === "grok" && islandKind === "auth")
   const zcodeLocalQuota = useQuota(null, "zcode", islandPlatform === "zcode" && islandKind === "auth")
-  const balance = useBalance(queries.balance)
-  const officialApiUsage = useApiUsage(queries.usage)
-  const localCost = useCostEstimate(islandPlatform, "today")
+  const balance = useBalance(queries.balance, cardsVisible)
+  const officialApiUsage = useApiUsage(queries.usage, cardsVisible)
+  const localCost = useCostEstimate(islandPlatform, "today", undefined, undefined, undefined, cardsVisible)
   useEffect(() => setQuotaNow(Date.now()), [islandPlatform])
-  const sourceMetrics = useSourceMetrics(islandPlatform, "today", null, null, quotaNow)
   const nativeMonitor = isFetchOnlyPlatform(islandPlatform as PlatformId) && islandPlatform !== "grok"
+  // 本机积分只有原生来源平台在卡片里展示；其他平台不查
+  const sourceMetrics = useSourceMetrics(islandPlatform, "today", null, null, quotaNow, nativeMonitor && cardsVisible)
   const remainingPlatform = isFetchOnlyPlatform(islandPlatform as PlatformId)
   const remainingQuota = islandPlatform === "grok" && islandKind === "auth" ? grokLocalQuota
     : islandPlatform === "zcode" && islandKind === "auth" ? zcodeLocalQuota : null
@@ -164,7 +169,8 @@ export function IslandWindow() {
     const offs: Array<() => void> = []
     const listen = (promise: Promise<() => void>) =>
       void promise.then((un) => { if (disposed) un(); else offs.push(un) }).catch(console.error)
-    listen(listenEvent<{ platform: string }>("live-usage", usage => { if (usage.platform === islandPlatform) setQuotaNow(Date.now()) }))
+    // 本平台统计真有变化才更新查询时刻（驱动本机积分重查），续期心跳与连续变化不逐条触发
+    offs.push(onUsageChanged(islandPlatform, () => setQuotaNow(Date.now())))
     // 网络额度/余额/用量刷新，多个刷新事件共用同一防重入闸门。
     const refreshNetwork = (scanSessions: boolean) => {
       if (refreshing.current) return
@@ -278,8 +284,8 @@ export function IslandWindow() {
         sessionSectionTitle: sourceFailed && live.sessions.length > 0
           ? `${live.sessions.length} 个会话状态未知`
           : live.activityCountText ?? undefined,
-        deltaText: live.deltaText,
-        deltaTokens: live.deltaTokens,
+        // 逐帧追数由叶子组件经 LiveCountsContext 订阅，岛体本身不随每帧重渲染
+        deltaCountKey: "total",
         deltaPhase: live.deltaPhase,
         status: nativeMonitor && active?.status === "connected" ? { tone: "success", label: "本机监控" } : islandConnectionStatus(active?.status ?? null, false, Boolean(settings.island_connection_id)),
         sourceText: `${collection.status && !collection.status.ok ? `采集异常：${collection.status.errors.join("；")} · ` : ""}${officialApiUsage.state?.state === "ok" ? `API 用量来源：${officialApiUsage.state.source} · ` : ""}统计来源：本机 ${PLATFORM_NAMES[islandPlatform] ?? islandPlatform} 会话记录（无法按账号区分）· ${live.activityKind === "running" ? "按本轮开始／结束事件及会话存活状态判断；思考、等待输入及压缩期间保留会话与 Token" : `${live.activeWindowSeconds} 秒内有新记录视为最近活跃`}`,
@@ -412,6 +418,7 @@ export function IslandWindow() {
 
   if (mode === "docked") {
     return (
+      <LiveCountsContext.Provider value={live.counts}>
       <div
         ref={shellRef}
         style={{ opacity: settings.island_opacity / 100, zoom: peek ? settings.island_scale / 100 : settings.island_shrink_scale / 100 }}
@@ -440,7 +447,7 @@ export function IslandWindow() {
               quotas={isTauri ? dockQuotas : CLAUDE_QUOTAS}
               unlimited={isTauri && quotaView.type === "unlimited"}
               unavailable={isTauri && !quotaWindows && quotaView.type !== "unlimited"}
-              pulse={dockPulseActive(live.deltaTokens, live.deltaPhase, settings.dnd, dragging)}
+              pulse={dockPulseActive(live.deltaPositive, live.deltaPhase, settings.dnd, dragging)}
               pulseKey={live.pulseSerial}
               refreshing={refreshActive}
               refreshKey={refreshSerial}
@@ -449,10 +456,12 @@ export function IslandWindow() {
         )}
         {!isTauri && <DockControls edge={edge} onEdge={setEdge} onUndock={undock} />}
       </div>
+      </LiveCountsContext.Provider>
     )
   }
 
   return (
+    <LiveCountsContext.Provider value={live.counts}>
     <div
       ref={shellRef}
       style={{ opacity: settings.island_opacity / 100, zoom: settings.island_scale / 100 }}
@@ -469,7 +478,7 @@ export function IslandWindow() {
           data={data}
           connectionMenuOpen={connectionMenuOpen}
           connectionSwitcher={
-            <IslandConnectionSwitcher
+            <LazyConnectionSwitcher
               connections={connections}
               selectedId={active?.id}
               loading={connectionsLoading}
@@ -487,6 +496,7 @@ export function IslandWindow() {
         <FreeControls mode={mode} onMode={setMode} onDock={(e) => { setEdge(e); setMode("docked") }} />
       )}
     </div>
+    </LiveCountsContext.Provider>
   )
 }
 

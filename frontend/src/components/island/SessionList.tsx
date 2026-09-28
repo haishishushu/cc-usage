@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { sessionElapsed } from "@/lib/sessionElapsed"
+import { compactTokens } from "@/lib/api"
+import { useLiveCount } from "@/lib/liveCounts"
 import { cn } from "@/lib/utils"
 import { MOTION_EASE, reducedMotion } from "@/lib/motion"
 import { Chip } from "@/components/ui/primitives"
@@ -114,35 +116,47 @@ export function SessionList({
         onPointerDown={(event) => event.stopPropagation()}
         onDoubleClick={(event) => event.stopPropagation()}>
       {sessions.map((s) => (
-        <div
-          key={s.id}
-          data-session-id={s.id}
-          tabIndex={0}
-          aria-label={`${s.title}，本轮已执行 ${elapsed(s)}，${s.deltaText === "—" ? "Token 暂无数据" : s.deltaText}`}
-          className={cn(
-            "flex w-full shrink-0 items-center gap-2 rounded-[6px] px-1 py-0.5 transition-colors focus:outline-none focus:ring-1 focus:ring-inset focus:ring-accent-blue",
-            s.highlighted && "bg-success-soft",
-          )}
-        >
-          <span className={cn("size-1.5 shrink-0 rounded-full", DOT[s.state])} />
-          <span className="min-w-0 flex-1 truncate text-xs text-text-primary" title={s.title}>
-            {s.title}
-          </span>
-          <StateTag state={s.state} showUnknown={showUnknownTag} />
-          <span className="tnum shrink-0 font-mono text-[10px] text-text-secondary" title="本轮任务已执行时间">
-            {elapsed(s)}
-          </span>
-          <span className={cn("tnum shrink-0 font-mono text-[10px]", s.deltaText === "—" ? "text-text-tertiary" : "text-success-text")}
-            title={s.startedAtMs ? "该会话本轮累计 Token" : "该会话实时采集的新增 Token"}>
-            {s.deltaText === "—" ? "— Token" : s.deltaText}
-          </span>
-        </div>
+        <SessionRow key={s.id} session={s} elapsed={elapsed(s)} showUnknownTag={showUnknownTag} />
       ))}
       </div>
       {remaining > 0 && (
         <p className="text-[11px] text-text-tertiary">{atEnd ? `已到列表底部 · 共 ${sessions.length} 个会话` : `向下滚动查看其余 ${remaining} 个会话 ↓`}</p>
       )}
       {(totalCount ?? sessions.length) > sessions.length && <p className="text-[11px] text-text-tertiary">另有 {totalCount! - sessions.length} 个会话尚未加载</p>}
+    </div>
+  )
+}
+
+/** 单行会话。逐帧 Token 由本行按 countKey 订阅：追数时只有数字变化的行重渲染。 */
+function SessionRow({ session: s, elapsed, showUnknownTag }: {
+  session: SessionActivity
+  elapsed: string
+  showUnknownTag: boolean
+}) {
+  const live = useLiveCount(s.countKey)
+  const deltaText = s.countKey ? (live == null ? "—" : `+${compactTokens(live)} Token`) : s.deltaText
+  return (
+    <div
+      data-session-id={s.id}
+      tabIndex={0}
+      aria-label={`${s.title}，本轮已执行 ${elapsed}，${deltaText === "—" ? "Token 暂无数据" : deltaText}`}
+      className={cn(
+        "flex w-full shrink-0 items-center gap-2 rounded-[6px] px-1 py-0.5 transition-colors focus:outline-none focus:ring-1 focus:ring-inset focus:ring-accent-blue",
+        s.highlighted && "bg-success-soft",
+      )}
+    >
+      <span className={cn("size-1.5 shrink-0 rounded-full", DOT[s.state])} />
+      <span className="min-w-0 flex-1 truncate text-xs text-text-primary" title={s.title}>
+        {s.title}
+      </span>
+      <StateTag state={s.state} showUnknown={showUnknownTag} />
+      <span className="tnum shrink-0 font-mono text-[10px] text-text-secondary" title="本轮任务已执行时间">
+        {elapsed}
+      </span>
+      <span className={cn("tnum shrink-0 font-mono text-[10px]", deltaText === "—" ? "text-text-tertiary" : "text-success-text")}
+        title={s.startedAtMs ? "该会话本轮累计 Token" : "该会话实时采集的新增 Token"}>
+        {deltaText === "—" ? "— Token" : deltaText}
+      </span>
     </div>
   )
 }

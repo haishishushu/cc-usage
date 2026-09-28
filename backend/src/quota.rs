@@ -80,8 +80,7 @@ fn parse_codex_usage(body: &str) -> QuotaState {
 
 pub fn codex_oauth_quota(access_token: &str, account: Option<&str>) -> QuotaState {
     // 固定官方地址并禁止重定向，凭证不会发送到自定义地址或重定向目标。
-    let client = match reqwest::blocking::Client::builder().timeout(TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none()).build() {
+    let client = match client() {
         Ok(c) => c,
         Err(_) => return QuotaState::Failed { reason: "无法创建 Codex 额度查询客户端".into() },
     };
@@ -358,12 +357,29 @@ fn parse_openai_admin_cost(body: &str) -> Result<f64, String> {
     Ok(total)
 }
 
+/// 额度、余额与套餐查询共用的客户端。blocking 客户端每次新建都要起一条后台运行时线程、
+/// 加载 TLS 根证书，且无法复用连接；同一轮刷新里的多次查询共用一个。
+/// 系统代理只在构建时读取，因此定期重建，用户切换代理后很快生效。
+/// 调用方都在阻塞线程池里（spawn_blocking），替换时丢弃旧客户端不会触发运行时析构限制。
 pub(crate) fn client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+    static SHARED: std::sync::Mutex<Option<(reqwest::blocking::Client, std::time::Instant)>> = std::sync::Mutex::new(None);
+    const REBUILD_AFTER: Duration = Duration::from_secs(120);
+    if let Ok(shared) = SHARED.lock() {
+        if let Some((client, built)) = shared.as_ref() {
+            if built.elapsed() < REBUILD_AFTER {
+                return Ok(client.clone());
+            }
+        }
+    }
+    let client = reqwest::blocking::Client::builder()
         .timeout(TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| format!("无法创建 HTTP 客户端: {e}"))
+        .map_err(|e| format!("无法创建 HTTP 客户端: {e}"))?;
+    // 旧客户端在锁释放后才析构，它的后台线程收尾不占着锁。
+    let previous = SHARED.lock().ok().and_then(|mut shared| shared.replace((client.clone(), std::time::Instant::now())));
+    drop(previous);
+    Ok(client)
 }
 
 /// HTTP 状态码 → 面向用户的原因文案。

@@ -1,29 +1,192 @@
-:root { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color-scheme: light dark; }
-* { box-sizing: border-box; }
-html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
-body { background: #f8fafc; color: #17243b; }
-.startup { display: flex; flex-direction: column; height: 100%; padding: 24px 27px; background: #f8fafc; border: 1px solid #dce3ed; border-radius: 14px; }
-.brand { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 700; letter-spacing: .01em; }
-.brand img { width: 21px; height: 21px; }
-.content { margin-top: 30px; }
-h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -.02em; }
-p { margin: 8px 0 0; color: #64748b; font-size: 12px; }
-.track { position: relative; height: 3px; margin-top: 24px; overflow: hidden; border-radius: 3px; background: #e3eaf4; }
-.track span { position: absolute; top: 0; bottom: 0; width: 32%; border-radius: inherit; background: #2563eb; animation: loading 1.4s ease-in-out infinite; }
-.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: auto; }
-.actions[hidden] { display: none; }
-button { min-width: 62px; border: 1px solid #cbd5e1; border-radius: 7px; padding: 6px 10px; background: #fff; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
-button:first-child { border-color: #2563eb; background: #2563eb; color: white; }
-button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
-.failed .track { display: none; }
-@keyframes loading { from { transform: translateX(-110%); } to { transform: translateX(315%); } }
-@media (prefers-color-scheme: dark) {
-  body, .startup { background: #111827; color: #edf2fa; }
-  .startup { border-color: #2d3a4c; }
-  p { color: #9baac1; }
-  .track { background: #2b3b55; }
-  .track span { background: #4f86f7; }
-  button { background: #1c2a3d; border-color: #45546b; }
-  button:first-child { background: #4f86f7; border-color: #4f86f7; color: #0c1422; }
+/* 启动窗口：透明无边框窗口（380×240），页面自绘 360×220 的卡片、描边与阴影。
+   配色取自 index.css 的主面板设计变量；深色随系统 prefers-color-scheme 切换
+   （主面板尚未加载，拿不到 .dark 类）。 */
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
 }
-@media (prefers-reduced-motion: reduce) { .track span { width: 45%; animation: none; } }
+
+:root {
+  font-family: "Inter", "Segoe UI", "Microsoft YaHei", sans-serif;
+  --card: #ffffff;
+  --card-border: #e3e3e6;
+  --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 10px -3px rgba(0, 0, 0, 0.12);
+  --text-primary: #111111;
+  --text-secondary: #8a8a8a;
+  --text-tertiary: #ababab;
+  --border-strong: #d6d6d6;
+  --hover: #f7f7f8;
+  --track: #e9ebef;
+  --success: #06c167;
+  --success-fade: rgba(6, 193, 103, 0.25);
+  --danger: #dc2626;
+  --mark-bg: #111111;
+  --mark-border: #111111;
+  --mark-track: #3a3a3a;
+  --primary-bg: #111111;
+  --primary-text: #ffffff;
+}
+
+* { box-sizing: border-box; }
+/* 窗口本身透明，color-scheme 不放在根上，避免深色系统下画布被填成深色 */
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+body {
+  padding: 10px;
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.startup {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  height: 100%;
+  padding: 22px 20px 14px;
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--card-shadow);
+  color-scheme: light dark;
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  animation: enter 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+/* 用量胶囊：比例同 favicon（深色胶囊 + 两根绿色用量条），两条错相伸缩 */
+.mark {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  width: 60px;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--mark-border);
+  border-radius: 19px;
+  background: var(--mark-bg);
+}
+.bar { position: relative; height: 7px; overflow: hidden; border-radius: 4px; background: var(--mark-track); }
+.bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: inherit;
+  background: var(--success);
+  animation: fill 1.6s cubic-bezier(0.65, 0, 0.35, 1) infinite alternate;
+}
+.bar + .bar i { width: 75%; animation-delay: -0.8s; }
+
+h1 {
+  margin: 16px 0 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+p {
+  display: -webkit-box;
+  max-width: 290px;
+  margin: 5px 0 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  text-wrap: balance;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* 不确定进度条：一段尾部渐隐的绿色光条循环扫过 */
+.track {
+  position: relative;
+  width: 200px;
+  height: 4px;
+  margin-top: 16px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--track);
+}
+.track span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 42%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--success-fade), var(--success));
+  animation: sweep 1.3s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+.foot { display: flex; align-items: center; justify-content: center; min-height: 30px; }
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.brand img { width: 14px; height: 14px; border-radius: 3px; }
+
+.actions { display: flex; gap: 8px; }
+.actions[hidden] { display: none; }
+button {
+  min-width: 76px;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s, opacity 0.15s;
+}
+button:hover { background: var(--hover); }
+button.primary { border-color: var(--primary-bg); background: var(--primary-bg); color: var(--primary-text); }
+button.primary:hover { opacity: 0.86; }
+button:focus-visible { outline: 2px solid var(--success); outline-offset: 2px; }
+
+/* 失败态：用量条变红并停住，进度条收起，底部品牌让位给操作按钮 */
+.failed .track, .failed .brand { display: none; }
+.failed .bar i { width: 100%; background: var(--danger); animation: none; }
+.failed .bar + .bar i { width: 45%; }
+
+@keyframes fill { from { width: 22%; } to { width: 92%; } }
+@keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(240%); } }
+@keyframes enter { from { opacity: 0; transform: translateY(4px); } }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --card: #181818;
+    --card-border: #303030;
+    --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 10px -3px rgba(0, 0, 0, 0.5);
+    --text-primary: #f5f5f5;
+    --text-secondary: #8e8e8e;
+    --text-tertiary: #6b6b6b;
+    --border-strong: #3a3a3a;
+    --hover: #202020;
+    --track: #2a2a2a;
+    --success: #28d07e;
+    --success-fade: rgba(40, 208, 126, 0.25);
+    --danger: #f26d6d;
+    --mark-bg: #242424;
+    --mark-border: #3a3a3a;
+    --mark-track: #333333;
+    --primary-bg: #f5f5f5;
+    --primary-text: #0d0d0d;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .content, .bar i { animation: none; }
+  .track span { width: 45%; animation: none; }
+}

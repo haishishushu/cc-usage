@@ -12,7 +12,7 @@ import { SettingsView, type SettingsSection } from "./SettingsView"
 import type { PlatformId } from "@/types"
 
 /**
- * 主面板窗口 —— 宽 1128；关闭时销毁窗口，后台采集继续运行。
+ * 主面板窗口 —— 宽 1128；关闭时只隐藏窗口（保留 WebView 以便秒开），后台采集继续运行。
  * 一级导航只有「总览 / 设置」两项。
  *
  * 「当前查看平台」与「灵动岛显示平台」是两个相互独立的值（§7.3）：
@@ -165,6 +165,7 @@ export function MainPanelWindow({
           />
         ) : (
           <SettingsView
+            panelActive={panelActive}
             section={section}
             navigationRequest={navigationRequest}
             islandPlatform={islandPlatform}

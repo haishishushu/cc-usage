@@ -37,6 +37,8 @@ mod validation;
 mod updater;
 mod cli_apply;
 mod effort_map;
+#[cfg(test)]
+mod perf_bench;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -96,8 +98,51 @@ fn list_sources(platform: String) -> Vec<SourceInfo> {
     local_source(&platform).into_iter().collect()
 }
 
-/// 全局数据库连接。采集与查询共用同一个后台，不为每个视图重复采集（§7.7）
+/// 全局写连接。采集、导入、连接管理等写入共用同一个后台，不为每个视图重复采集（§7.7）
 pub struct Db(pub Arc<Mutex<rusqlite::Connection>>);
+
+/// 只读查询连接池：统计、日志与实时快照走这里。WAL 允许读写并发，
+/// 查询不再排在采集写入后面，采集也不必等界面查询。
+pub struct DbRead(pub Arc<ReadPool>);
+
+pub struct ReadPool {
+    conns: Vec<Mutex<rusqlite::Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadPool {
+    /// 主面板一次刷新会并发发出多条查询，灵动岛与托盘还各有一条；三条连接足够不排队。
+    const SIZE: usize = 3;
+
+    fn open(path: &std::path::Path) -> rusqlite::Result<Self> {
+        let conns = (0..Self::SIZE)
+            .map(|_| db::open_reader(path).map(Mutex::new))
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Self { conns, next: std::sync::atomic::AtomicUsize::new(0) })
+    }
+
+    /// 优先取空闲连接；都在忙时轮转排队，绝不退回写连接。
+    pub fn with<T>(&self, work: impl FnOnce(&rusqlite::Connection) -> T) -> T {
+        for conn in &self.conns {
+            if let Ok(guard) = conn.try_lock() {
+                return work(&guard);
+            }
+        }
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+        let guard = self.conns[index].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        work(&guard)
+    }
+}
+
+/// 在阻塞线程池上借一条只读连接执行查询。
+async fn with_reader<T: Send + 'static>(
+    pool: Arc<ReadPool>,
+    work: impl FnOnce(&rusqlite::Connection) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || pool.with(work))
+        .await
+        .map_err(|e| e.to_string())?
+}
 
 /// 在阻塞线程池等待数据库锁，避免扫描期间卡住窗口或异步运行时。
 async fn with_database<T: Send + 'static>(
@@ -155,6 +200,34 @@ mod responsiveness_tests {
     }
 
     #[test]
+    fn read_queries_do_not_wait_for_the_collector_write_lock() {
+        let dir = std::env::temp_dir().join(format!("cc-usage-read-pool-{}", std::process::id()));
+        let path = dir.join("usage.db");
+        let writer = Arc::new(Mutex::new(db::open(&path).unwrap()));
+        let pool = ReadPool::open(&path).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let busy = writer.clone();
+        let collector = std::thread::spawn(move || {
+            let _guard = busy.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        ready_rx.recv().unwrap();
+        let started = Instant::now();
+        let count: i64 = pool.with(|conn| conn.query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))).unwrap();
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        collector.join().unwrap();
+        assert_eq!(count, 0);
+        assert!(elapsed < Duration::from_millis(250), "只读查询被写锁阻塞: {elapsed:?}");
+        assert!(pool.with(|conn| conn.execute("DELETE FROM requests", [])).is_err(), "只读连接不得写入");
+        drop(pool);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn reversed_custom_ranges_are_rejected_before_database_work() {
         let range = db::CustomRange { start: 2_000, end: Some(1_000) };
         assert_eq!(
@@ -197,6 +270,23 @@ mod responsiveness_tests {
             || { calls.fetch_add(1, Ordering::SeqCst); 8 },
         ), 8);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn periodic_refresh_reuses_a_recent_fetch_but_not_an_older_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = QueryCache::<usize>::default();
+        let calls = AtomicUsize::new(0);
+        let fetch = || { calls.fetch_add(1, Ordering::SeqCst); 1 };
+        cached_query(&cache, "k".into(), false, |_| CacheOutcome::Success, fetch);
+        // 另一个窗口的定时刷新落在同一周期内：复用刚取得的结果
+        cached_query(&cache, "k".into(), refresh_mode(false, Some(60_000)), |_| CacheOutcome::Success, fetch);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 缓存已比刷新间隔旧：即使尚未过期也重新查询
+        std::thread::sleep(Duration::from_millis(20));
+        cached_query(&cache, "k".into(), refresh_mode(false, Some(10)), |_| CacheOutcome::Success, fetch);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(refresh_mode(true, Some(10)), Refresh::Force);
     }
 
     #[test]
@@ -284,7 +374,8 @@ enum MainIntent {
 static MAIN_INTENT: LazyLock<Mutex<Option<MainIntent>>> = LazyLock::new(|| Mutex::new(None));
 
 struct QueryCacheState<T> {
-    entries: HashMap<String, (T, Instant, bool)>,
+    /// 值、过期时刻、是否处于退避期、取得时刻
+    entries: HashMap<String, (T, Instant, bool, Instant)>,
     in_flight: HashSet<String>,
     failures: HashMap<String, u32>,
     generations: HashMap<String, u64>,
@@ -315,20 +406,53 @@ impl<T> Default for QueryCache<T> {
 #[derive(Clone, Copy)]
 enum CacheOutcome { Success, RateLimited(u64), Failed, StableFailure }
 
+/// 调用方对缓存新鲜度的要求。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Refresh {
+    /// 有效缓存即可
+    Cached,
+    /// 用户显式刷新：跳过成功缓存
+    Force,
+    /// 定时刷新：缓存取得不超过这么久就复用。多个窗口各自按刷新间隔轮询同一连接，
+    /// 同一周期内只打一次上游，又不会因缓存把间隔拖长。
+    MaxAge(Duration),
+}
+
+impl From<bool> for Refresh {
+    fn from(force: bool) -> Self {
+        if force { Refresh::Force } else { Refresh::Cached }
+    }
+}
+
+/// 命令参数到刷新模式：显式 force 优先，其次是定时刷新给出的最大缓存年龄。
+fn refresh_mode(force: bool, max_age_ms: Option<u64>) -> Refresh {
+    match (force, max_age_ms) {
+        (true, _) => Refresh::Force,
+        (false, Some(ms)) => Refresh::MaxAge(Duration::from_millis(ms)),
+        (false, None) => Refresh::Cached,
+    }
+}
+
 fn cached_query<T: Clone>(
     cache: &QueryCache<T>,
     key: String,
-    force: bool,
+    refresh: impl Into<Refresh>,
     classify: impl Fn(&T) -> CacheOutcome,
     query: impl FnOnce() -> T,
 ) -> T {
+    let refresh = refresh.into();
     let mut waited = false;
     let generation;
     loop {
         let Ok(mut state) = cache.state.lock() else { return query() };
-        if let Some((value, expires, backoff)) = state.entries.get(&key) {
+        if let Some((value, expires, backoff, fetched)) = state.entries.get(&key) {
+            let wants_fresh = match refresh {
+                Refresh::Cached => false,
+                Refresh::Force => true,
+                Refresh::MaxAge(age) => fetched.elapsed() >= age,
+            };
             // 显式刷新可以跳过成功缓存；限流和网络失败的退避期仍必须遵守。
-            if waited || (*expires > Instant::now() && (!force || *backoff)) {
+            if waited || (*expires > Instant::now() && (!wants_fresh || *backoff)) {
                 return value.clone();
             }
         }
@@ -365,7 +489,8 @@ fn cached_query<T: Clone>(
         // 凭证在查询期间被替换时，不把旧凭证的响应重新放回缓存。
         if state.generations.get(&key).copied().unwrap_or(0) == generation {
             let backoff = matches!(outcome, CacheOutcome::RateLimited(_) | CacheOutcome::Failed);
-            state.entries.insert(key, (value.clone(), Instant::now() + ttl, backoff));
+            let now = Instant::now();
+            state.entries.insert(key, (value.clone(), now + ttl, backoff, now));
         }
         cache.ready.notify_all();
     }
@@ -462,7 +587,8 @@ fn collection_status() -> CollectionStatus {
 }
 
 #[tauri::command]
-async fn local_codex_quota(app: tauri::AppHandle, force: bool) -> Result<quota::QuotaState, String> {
+async fn local_codex_quota(app: tauri::AppHandle, force: bool, max_age_ms: Option<u64>) -> Result<quota::QuotaState, String> {
+    let force = refresh_mode(force, max_age_ms);
     let state = tauri::async_runtime::spawn_blocking(move || cached_query(
         &QUOTA_CACHE,
         "local-codex".into(),
@@ -484,7 +610,8 @@ async fn local_codex_quota(app: tauri::AppHandle, force: bool) -> Result<quota::
 /// 查本机 Grok 订阅额度（~/.grok/auth.json 的 OAuth 凭证）。
 /// 灵动岛托盘图标逻辑目前只覆盖 claude/codex，Grok 额度仅在主面板展示。
 #[tauri::command]
-async fn local_grok_quota(force: bool) -> Result<quota::QuotaState, String> {
+async fn local_grok_quota(force: bool, max_age_ms: Option<u64>) -> Result<quota::QuotaState, String> {
+    let force = refresh_mode(force, max_age_ms);
     tauri::async_runtime::spawn_blocking(move || cached_query(
         &QUOTA_CACHE,
         "local-grok".into(),
@@ -497,7 +624,8 @@ async fn local_grok_quota(force: bool) -> Result<quota::QuotaState, String> {
 
 /// 查询本机 ZCode BigModel Coding Plan API Key 的套餐额度。
 #[tauri::command]
-async fn local_zcode_quota(force: bool) -> Result<quota::QuotaState, String> {
+async fn local_zcode_quota(force: bool, max_age_ms: Option<u64>) -> Result<quota::QuotaState, String> {
+    let force = refresh_mode(force, max_age_ms);
     tauri::async_runtime::spawn_blocking(move || cached_query(
         &QUOTA_CACHE,
         "local-zcode".into(),
@@ -571,14 +699,14 @@ fn resize_island(app: tauri::AppHandle, width: f64, height: f64) -> Result<Optio
 
 #[tauri::command]
 async fn token_totals(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     custom: Option<db::CustomRange>,
     model: Option<String>,
     query_end_ms: i64,
 ) -> Result<db::PeriodTotals, String> {
     validate_query_range(custom, query_end_ms)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::token_totals_at(conn, &platform, custom, model.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
@@ -588,11 +716,11 @@ async fn token_totals(
 /// 区间内的 Token 分项（新增输入 / 输出 / 缓存写入 / 缓存命中）、请求数与命中率。
 /// 未知字段保持 null 交给界面显示「—」，不在这里补零。
 #[tauri::command]
-async fn source_metrics(db: State<'_, Db>, platform:String, period:String,
+async fn source_metrics(db: State<'_, DbRead>, platform:String, period:String,
     custom:Option<db::CustomRange>, model:Option<String>, query_end_ms:i64) -> Result<source_store::Metrics,String> {
     validate_query_range(custom,query_end_ms)?;
     if !platforms::known(&platform) {return Err("未知平台".into());}
-    with_database(db.0.clone(),move |conn| {
+    with_reader(db.0.clone(),move |conn| {
         let (start,end)=db::resolve_range_at(conn,&platform,&period,custom,query_end_ms);
         source_store::metrics(conn,&platform,start,end,model.as_deref()).map_err(|e|e.to_string())
     }).await
@@ -600,7 +728,7 @@ async fn source_metrics(db: State<'_, Db>, platform:String, period:String,
 
 #[tauri::command]
 async fn usage_breakdown(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     period: String,
     custom: Option<db::CustomRange>,
@@ -608,7 +736,7 @@ async fn usage_breakdown(
     query_end_ms: i64,
 ) -> Result<db::UsageBreakdown, String> {
     validate_query_range(custom, query_end_ms)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::usage_breakdown_at(conn, &platform, &period, custom, model.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
@@ -618,14 +746,14 @@ async fn usage_breakdown(
 /// 当前范围内出现过的模型名，供筛选下拉使用
 #[tauri::command]
 async fn list_models(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     period: String,
     custom: Option<db::CustomRange>,
     query_end_ms: i64,
 ) -> Result<Vec<String>, String> {
     validate_query_range(custom, query_end_ms)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::list_models_at(conn, &platform, &period, custom, query_end_ms).map_err(|e| e.to_string())
     })
     .await
@@ -647,11 +775,11 @@ fn log_front(msg: String) {
 /// 灵动岛实时用量：自 `since` 游标以来的新增 Token、涉及的会话、最近活跃会话
 #[tauri::command]
 async fn live_usage(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     since: Option<i64>,
 ) -> Result<db::LiveUsage, String> {
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         let r = session_presence::live_usage(conn, &platform, since).map_err(|e| e.to_string())?;
         if since.is_none() || r.delta_tokens > 0 {
             println!(
@@ -666,7 +794,7 @@ async fn live_usage(
 
 #[tauri::command]
 async fn usage_trend(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     period: String,
     custom: Option<db::CustomRange>,
@@ -674,7 +802,7 @@ async fn usage_trend(
     query_end_ms: i64,
 ) -> Result<db::Trend, String> {
     validate_query_range(custom, query_end_ms)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::trend_at(conn, &platform, &period, custom, model.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
@@ -683,7 +811,7 @@ async fn usage_trend(
 
 #[tauri::command]
 async fn request_log(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     period: String,
     page: u32,
@@ -692,7 +820,7 @@ async fn request_log(
     query_end_ms: i64,
 ) -> Result<db::LogPage, String> {
     validate_query_range(custom, query_end_ms)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::request_log_at(conn, &platform, &period, page, custom, model.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
@@ -931,9 +1059,9 @@ fn set_retention_days(app: tauri::AppHandle, days: Option<u32>) -> Result<settin
 }
 
 #[tauri::command]
-async fn cleanup_preview(db: State<'_, Db>, days: u32) -> Result<db::CleanupPreview, String> {
+async fn cleanup_preview(db: State<'_, DbRead>, days: u32) -> Result<db::CleanupPreview, String> {
     let cutoff = retention_cutoff(days)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::cleanup_preview(conn, cutoff).map_err(|error| error.to_string())
     }).await
 }
@@ -949,11 +1077,11 @@ async fn cleanup_history(app: tauri::AppHandle, db: State<'_, Db>, days: u32) ->
 }
 
 #[tauri::command]
-async fn export_data(db: State<'_, Db>, platform: Option<String>) -> Result<String, String> {
+async fn export_data(db: State<'_, DbRead>, platform: Option<String>) -> Result<String, String> {
     if platform.as_deref().is_some_and(|value| !platforms::known(value)) {
         return Err("导出范围必须是全部、Claude 或 Codex".into());
     }
-    with_database(db.0.clone(), move |conn| db::export_backup(conn, platform.as_deref())).await
+    with_reader(db.0.clone(), move |conn| db::export_backup(conn, platform.as_deref())).await
 }
 
 #[tauri::command]
@@ -1022,7 +1150,7 @@ fn dock_undock(app: tauri::AppHandle, cfg: State<Cfg>) {
 /// 区间内的估算费用（§2.4）。本地记录不含账单，界面必须标注「估算」
 #[tauri::command]
 async fn cost_estimate(
-    db: State<'_, Db>,
+    db: State<'_, DbRead>,
     platform: String,
     period: String,
     custom: Option<db::CustomRange>,
@@ -1030,7 +1158,7 @@ async fn cost_estimate(
     query_end_ms: i64,
 ) -> Result<db::CostEstimate, String> {
     validate_query_range(custom, query_end_ms)?;
-    with_database(db.0.clone(), move |conn| {
+    with_reader(db.0.clone(), move |conn| {
         db::cost_estimate_at(conn, &platform, &period, custom, model.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
@@ -1046,7 +1174,8 @@ async fn cost_estimate(
 /// 否则按平台走官方端点。**官方 OAuth 用量端点只认 OAuth token**，因此 API Key
 /// 连接返回「不支持」而非「凭证失效」——后者会让用户白跑一趟重新授权。
 #[tauri::command]
-async fn connection_quota(app: tauri::AppHandle, db: State<'_, Db>, id: String, force: bool) -> Result<quota::QuotaState, String> {
+async fn connection_quota(app: tauri::AppHandle, db: State<'_, Db>, id: String, force: bool, max_age_ms: Option<u64>) -> Result<quota::QuotaState, String> {
+    let force = refresh_mode(force, max_age_ms);
     let pool = db.0.clone();
     let lookup_id = id.clone();
     let Some(c) = with_database(pool.clone(), move |conn| {
@@ -1148,7 +1277,8 @@ fn validate_query_range(custom: Option<db::CustomRange>, query_end_ms: i64) -> R
 /// 查直连 API Key 的官方组织用量与费用。普通调用 Key 返回权限不足，前端继续使用
 /// 本机会话记录和估算费用；Admin Key 则优先显示官方聚合结果。
 #[tauri::command]
-async fn connection_api_usage(app: tauri::AppHandle, db: State<'_, Db>, id: String, force: bool) -> Result<quota::ApiUsageState, String> {
+async fn connection_api_usage(app: tauri::AppHandle, db: State<'_, Db>, id: String, force: bool, max_age_ms: Option<u64>) -> Result<quota::ApiUsageState, String> {
+    let force = refresh_mode(force, max_age_ms);
     let pool = db.0.clone();
     let lookup_id = id.clone();
     let Some(c) = with_database(pool.clone(), move |conn| {
@@ -1202,7 +1332,8 @@ async fn connection_api_usage(app: tauri::AppHandle, db: State<'_, Db>, id: Stri
 /// 查余额。目前只有 sub2api 网关提供钱包余额；
 /// 官方订阅没有「余额」概念，如实返回不支持。
 #[tauri::command]
-async fn connection_balance(app: tauri::AppHandle, db: State<'_, Db>, id: String, force: bool) -> Result<quota::BalanceState, String> {
+async fn connection_balance(app: tauri::AppHandle, db: State<'_, Db>, id: String, force: bool, max_age_ms: Option<u64>) -> Result<quota::BalanceState, String> {
+    let force = refresh_mode(force, max_age_ms);
     let pool = db.0.clone();
     let lookup_id = id.clone();
     let Some(c) = with_database(pool.clone(), move |conn| {
@@ -1380,8 +1511,8 @@ fn proxy_status(app: tauri::AppHandle) -> proxy::ProxyStatus {
 /* --------------------------- 连接管理（§6.3） --------------------------- */
 
 #[tauri::command]
-async fn list_connections(db: State<'_, Db>) -> Result<Vec<connections::ConnectionDto>, String> {
-    with_database(db.0.clone(), move |conn| {
+async fn list_connections(db: State<'_, DbRead>) -> Result<Vec<connections::ConnectionDto>, String> {
+    with_reader(db.0.clone(), move |conn| {
         connections::list(conn).map_err(|e| e.to_string())
     })
     .await
@@ -1884,9 +2015,12 @@ fn show_startup(app: &tauri::AppHandle) -> tauri::Result<()> {
     } else {
         WebviewWindowBuilder::new(app, STARTUP, WebviewUrl::App("startup.html".into()))
             .title("CC Usage · 启动中")
-            .inner_size(360.0, 220.0)
+            // 卡片 360×220，四周各留 10px 透明边距给页面自绘的阴影
+            .inner_size(380.0, 240.0)
             .resizable(false)
             .decorations(false)
+            .transparent(true)
+            .shadow(false)
             .skip_taskbar(true)
             .center()
             .build()?
@@ -1987,7 +2121,7 @@ fn ensure_island_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> 
     Ok(window)
 }
 
-/// 主面板首次使用时才创建；关闭后 WebView 被销毁，后台采集与灵动岛继续运行。
+/// 主面板首次使用时才创建；关闭只隐藏窗口并保留 WebView，后台采集与灵动岛继续运行。
 fn show_main(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN) {
         if MAIN_READY.load(Ordering::Acquire) {
@@ -2053,6 +2187,11 @@ fn initialize_app(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Result<
         let conn = db::open(&data_dir.join("usage.db")).map_err(|error| error.to_string())?;
         effort_map::seed(&conn).map_err(|error| error.to_string())?;
         app.manage(Db(Arc::new(Mutex::new(conn))));
+    }
+    if app.try_state::<DbRead>().is_none() {
+        // 写连接已完成建表与迁移，只读连接此后打开才能看到完整结构。
+        let pool = ReadPool::open(&data_dir.join("usage.db")).map_err(|error| error.to_string())?;
+        app.manage(DbRead(Arc::new(pool)));
     }
 
     // 恢复已有用户的停靠状态；首次安装先展示自由态灵动岛，再自动贴上边缘。
@@ -2287,11 +2426,22 @@ fn tray_quota_icon(app: &tauri::AppHandle, state: &quota::QuotaState, is_auth: b
     tray_icon::badge(&tray_icon::base(size), color)
 }
 
+/// 上次设置到托盘的 (颜色, 像素尺寸)。每次额度返回都会调用更新，
+/// 图标内容没变时不重绘、不重复调用系统托盘接口。
+static TRAY_ICON_SHOWN: Mutex<Option<([u8; 3], usize)>> = Mutex::new(None);
+
 fn update_tray_quota_icon(app: &tauri::AppHandle, _state: &quota::QuotaState) {
     if let Some(tray) = app.tray_by_id("main-tray") {
         let state = tray_summary::current_state(app);
         let is_auth = app.state::<Cfg>().0.get().island_kind == "auth";
-        let _ = tray.set_icon(Some(tray_quota_icon(app, &state, is_auth)));
+        let look = (tray_quota_color(&state, is_auth), tray_icon::output_size(tray_scale_factor(app)));
+        let Ok(mut shown) = TRAY_ICON_SHOWN.lock() else { return };
+        if *shown == Some(look) {
+            return;
+        }
+        if tray.set_icon(Some(tray_icon::badge(&tray_icon::base(look.1), look.0))).is_ok() {
+            *shown = Some(look);
+        }
     }
 }
 
@@ -2540,6 +2690,17 @@ pub fn run() {
         .on_window_event(|window, event| {
             if window.label() == MAIN {
                 record_main_window_event(window, event);
+                // 关闭只隐藏、保留 WebView，托盘再次打开时秒开，不再重建主面板并走启动窗。
+                // 未就绪的主面板（加载失败等）照常关闭，下次打开会重新创建。
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    if MAIN_READY.load(Ordering::Acquire) {
+                        api.prevent_close();
+                        if let Err(error) = window.hide() {
+                            eprintln!("[窗口] 隐藏主面板失败: {error}");
+                        }
+                        return;
+                    }
+                }
             }
             if window.label() == ISLAND {
                 if let WindowEvent::CloseRequested { api, .. } = event {

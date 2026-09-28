@@ -5,7 +5,7 @@
 //!
 //! 约束（§7.7）：增量读取与去重，避免定时全量扫描、反复解析全部历史。
 
-use crate::db::{self, RequestRecord};
+use crate::db::{self, RequestRecord, Store};
 use chrono::DateTime;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -23,21 +23,15 @@ struct TitleHit {
     title: String,
 }
 
-fn parse_title(line: &str, kind: &str) -> Option<TitleHit> {
-    let v: Value = serde_json::from_str(line).ok()?;
-    match kind {
-        "claude" => {
-            if v.get("type")?.as_str()? != "ai-title" {
-                return None;
-            }
-            Some(TitleHit {
-                platform: "claude",
-                session_id: v.get("sessionId")?.as_str()?.to_string(),
-                title: v.get("aiTitle")?.as_str()?.trim().to_string(),
-            })
-        }
-        _ => None,
+fn parse_claude_title(v: &Value) -> Option<TitleHit> {
+    if v.get("type")?.as_str()? != "ai-title" {
+        return None;
     }
+    Some(TitleHit {
+        platform: "claude",
+        session_id: v.get("sessionId")?.as_str()?.to_string(),
+        title: v.get("aiTitle")?.as_str()?.trim().to_string(),
+    })
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -67,17 +61,42 @@ fn n(v: &Value, key: &str) -> Option<i64> {
     v.get(key).and_then(Value::as_i64)
 }
 
-/// 递归收集某目录下的 .jsonl
+/// 递归收集某目录下的 .jsonl。目录判断用枚举结果自带的类型，不再逐项 stat。
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
-        if p.is_dir() {
+        let is_dir = match e.file_type() {
+            Ok(kind) if kind.is_symlink() => p.is_dir(),
+            Ok(kind) => kind.is_dir(),
+            Err(_) => p.is_dir(),
+        };
+        if is_dir {
             collect_jsonl(&p, out);
         } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
             out.push(p);
         }
     }
+}
+
+fn modified_ms(meta: &std::fs::Metadata) -> i64 {
+    meta.modified().ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 与 [`scan_file`] 的续读判定同口径：位点已追平且文件未被重写时，整份跳过，
+/// 不必为它拿写锁。拿不到文件信息时交给 `scan_file` 报告真实错误。
+/// 大小与修改时间取自文件句柄而非目录枚举：正在追加的文件，目录项里的大小可能滞后。
+fn needs_scan(path: &Path, saved: Option<&db::ScanStamp>) -> bool {
+    let Some(saved) = saved else { return true };
+    let Ok(meta) = std::fs::metadata(path) else { return true };
+    let size = meta.len() as i64;
+    let rewritten = saved.offset > size
+        || (saved.offset == size && saved.offset > 0 && saved.mtime != modified_ms(&meta));
+    let rebuild = saved.offset > 0 && !saved.parser_initialized;
+    rewritten || rebuild || saved.offset != size
 }
 
 /// 从上次偏移继续读；文件被截断或重写（当前大小 < 已读偏移）则整文件重扫
@@ -132,8 +151,7 @@ fn read_new_lines(conn: &Connection, path: &Path) -> std::io::Result<(Vec<String
 /// 该来源**不提供** costUSD —— 对应界面上成本标「估算」。请求耗时 / 首字 / HTTP 码
 /// 会话记录里没有：本地代理（proxy.rs）开启时由转发计时按去重键回填，未开启时为
 /// NULL，界面显示「—」，不伪造。
-fn parse_claude_line(line: &str) -> Option<RequestRecord> {
-    let v: Value = serde_json::from_str(line).ok()?;
+fn parse_claude_line(v: &Value) -> Option<RequestRecord> {
     if v.get("type")?.as_str()? != "assistant" {
         return None;
     }
@@ -190,11 +208,10 @@ fn nested_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 }
 
 fn parse_codex_line(
-    line: &str,
+    v: &Value,
     current_model: &mut Option<String>,
     current_effort: &mut Option<String>,
 ) -> Option<RequestRecord> {
-    let v: Value = serde_json::from_str(line).ok()?;
     let ty = v.get("type").and_then(Value::as_str)?;
 
     if ty == "turn_context" {
@@ -271,13 +288,14 @@ where
 {
     let mut state = SessionFileState::default();
     for line in lines {
-        apply_codex_file_state(&mut state, line.as_ref());
+        if let Ok(value) = serde_json::from_str::<Value>(line.as_ref()) {
+            apply_codex_file_state(&mut state, &value);
+        }
     }
     state
 }
 
-fn apply_codex_file_state(state: &mut SessionFileState, line: &str) {
-    let Ok(value) = serde_json::from_str::<Value>(line) else { return };
+fn apply_codex_file_state(state: &mut SessionFileState, value: &Value) {
     let Some(kind) = value.get("type").and_then(Value::as_str) else { return };
     let payload = value.get("payload");
 
@@ -320,8 +338,15 @@ fn apply_codex_file_state(state: &mut SessionFileState, line: &str) {
     }
 }
 
+/// 测试用：按原始日志行驱动生命周期解析。
+#[cfg(test)]
 fn apply_claude_file_state(state: &mut SessionFileState, line: &str) {
-    let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+    if let Ok(value) = serde_json::from_str::<Value>(line) {
+        apply_claude_value(state, &value);
+    }
+}
+
+fn apply_claude_value(state: &mut SessionFileState, v: &Value) {
     if v.get("isSidechain").and_then(Value::as_bool) == Some(true) { return; }
     let Some(id) = v.get("sessionId").and_then(Value::as_str) else { return };
     let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_millis) else { return };
@@ -362,14 +387,15 @@ fn apply_claude_file_state(state: &mut SessionFileState, line: &str) {
     }
 }
 
-fn scan_files<I>(conn: &mut Connection, files: I) -> ScanResult
+fn scan_files<I>(db: &mut impl Store, files: I) -> ScanResult
 where
     I: IntoIterator<Item = (PathBuf, &'static str)>,
 {
     let mut result = ScanResult::default();
     for (path, kind) in files {
         result.files_scanned += 1;
-        match scan_file(conn, &path, kind) {
+        // 每个文件单独持锁：文件之间让出写锁，长时间回填也不会堵住用户操作。
+        match db.write(|conn| scan_file(conn, &path, kind)) {
             Ok(inserted) => result.records_inserted += inserted,
             Err(error) => {
                 result.errors.push(format!(
@@ -392,10 +418,7 @@ fn scan_file(conn: &mut Connection, path: &Path, kind: &str) -> Result<usize, St
     let key = path.to_string_lossy().to_string();
     let meta = std::fs::metadata(path).map_err(|error| error.to_string())?;
     let size = meta.len() as i64;
-    let mtime = meta.modified().ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
+    let mtime = modified_ms(&meta);
     let saved = db::get_scan_checkpoint(conn, &key).unwrap_or_default();
     let rewritten = saved.offset > size
         || (saved.offset == size && saved.offset > 0 && saved.mtime != mtime);
@@ -448,20 +471,23 @@ fn scan_file(conn: &mut Connection, path: &Path, kind: &str) -> Result<usize, St
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(title) = parse_title(line, kind) {
-            if !title.title.is_empty() {
-                db::upsert_session_title(&tx, title.platform, &title.session_id, &title.title)
-                    .map_err(|error| error.to_string())?;
+        // 每行只解析一次，标题、生命周期与用量记录共用同一份结构；
+        // 工具输出动辄几十 KB，重复解析是回填时的主要开销。
+        let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+        if kind == "claude" {
+            if let Some(title) = parse_claude_title(&value) {
+                if !title.title.is_empty() {
+                    db::upsert_session_title(&tx, title.platform, &title.session_id, &title.title)
+                        .map_err(|error| error.to_string())?;
+                }
             }
-        }
-        if kind == "codex" {
-            apply_codex_file_state(&mut parser, line);
-        } else if kind == "claude" {
-            apply_claude_file_state(&mut parser, line);
+            apply_claude_value(&mut parser, &value);
+        } else if kind == "codex" {
+            apply_codex_file_state(&mut parser, &value);
         }
         let record = match kind {
-            "claude" => parse_claude_line(line),
-            _ => parse_codex_line(line, &mut parser.model, &mut parser.effort),
+            "claude" => parse_claude_line(&value),
+            _ => parse_codex_line(&value, &mut parser.model, &mut parser.effort),
         };
         if let Some(record) = record {
             batch.push(record);
@@ -484,10 +510,10 @@ fn scan_file(conn: &mut Connection, path: &Path, kind: &str) -> Result<usize, St
             db::set_session_activity(&tx, kind, session_id, state, updated_at_ms)
                 .map_err(|error| error.to_string())?;
             if let Some(started_at) = parser.turn_started_ms {
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE sessions SET turn_started_ms = ?1 WHERE platform = ?3 AND session_id = ?2",
-                    rusqlite::params![started_at, session_id, kind],
-                ).map_err(|error| error.to_string())?;
+                ).and_then(|mut stmt| stmt.execute(rusqlite::params![started_at, session_id, kind]))
+                .map_err(|error| error.to_string())?;
             }
         }
     }
@@ -505,7 +531,7 @@ fn scan_file(conn: &mut Connection, path: &Path, kind: &str) -> Result<usize, St
     Ok(inserted)
 }
 
-pub fn scan(conn: &mut Connection) -> ScanResult {
+pub fn scan(db: &mut impl Store) -> ScanResult {
     let mut result = ScanResult::default();
     let Some(home) = home() else {
         result.errors.push("无法定位用户主目录".into());
@@ -514,7 +540,7 @@ pub fn scan(conn: &mut Connection) -> ScanResult {
 
     let claude_dir = home.join(".claude").join("projects");
     let codex_home = crate::session_titles::codex_home().unwrap_or_else(|| home.join(".codex"));
-    if let Err(e) = crate::session_titles::sync_codex(conn, &codex_home) {
+    if let Err(e) = crate::session_titles::sync_codex_if_changed(db, &codex_home) {
         result.errors.push(e);
         result.failed_sources.push("codex".into());
     }
@@ -534,22 +560,32 @@ pub fn scan(conn: &mut Connection) -> ScanResult {
         files.extend(paths.into_iter().map(|path| (path, "codex")));
     }
 
-    let scanned = scan_files(conn, files);
-    result.files_scanned = scanned.files_scanned;
+    // 心跳时绝大多数文件没有新字节：一次读出全部位点，在锁外比对大小与修改时间，
+    // 只把有变化的文件交给逐文件加锁的采集。
+    let listed = files.len();
+    let stamps = db.write(|conn| db::scan_stamps(conn)).unwrap_or_default();
+    files.retain(|(path, _)| needs_scan(path, stamps.get(path.to_string_lossy().as_ref())));
+    let scanned = scan_files(db, files);
+    result.files_scanned = listed;
     result.records_inserted = scanned.records_inserted;
     result.errors.extend(scanned.errors);
     result.failed_sources.extend(scanned.failed_sources);
-    let native=crate::native_sources::scan(conn);
-    result.files_scanned+=native.files_scanned;
-    result.records_inserted+=native.records_inserted;
-    result.errors.extend(native.errors);
-    result.failed_sources.extend(native.failed_sources);
+    merge(&mut result, crate::native_sources::scan(db));
     result
+}
+
+fn merge(result: &mut ScanResult, other: ScanResult) {
+    result.files_scanned += other.files_scanned;
+    result.records_inserted += other.records_inserted;
+    result.errors.extend(other.errors);
+    result.failed_sources.extend(other.failed_sources);
 }
 
 /// notify 已经给出具体变化路径时，只处理这些文件；路径必须位于已知 CLI
 /// 会话目录内，避免把任意外部文件送进解析器。周期心跳仍调用 `scan` 全量补漏。
-pub fn scan_paths(conn: &mut Connection, changed: impl IntoIterator<Item = PathBuf>) -> ScanResult {
+/// 本机来源（Gemini / Qoder / WorkBuddy / Zcode）只在变化落在其目录内时才扫描，
+/// Claude / Codex 的每次写入不再连带重扫它们。
+pub fn scan_paths(db: &mut impl Store, changed: impl IntoIterator<Item = PathBuf>) -> ScanResult {
     let mut result = ScanResult::default();
     let Some(home) = home() else {
         result.errors.push("无法定位用户主目录".into());
@@ -564,6 +600,7 @@ pub fn scan_paths(conn: &mut Connection, changed: impl IntoIterator<Item = PathB
 
     let mut unique = HashSet::new();
     let mut files = Vec::new();
+    let mut native = Vec::new();
     let mut sync_titles = false;
     for path in changed {
         if !unique.insert(path.clone()) {
@@ -581,25 +618,25 @@ pub fn scan_paths(conn: &mut Connection, changed: impl IntoIterator<Item = PathB
             && path.is_file()
         {
             files.push((path, "codex"));
+        } else {
+            native.push(path);
         }
     }
     if sync_titles {
-        if let Err(error) = crate::session_titles::sync_codex(conn, &codex_home) {
+        if let Err(error) = crate::session_titles::sync_codex_if_changed(db, &codex_home) {
             result.errors.push(error);
             // 标题索引属于 Codex 来源，失败同样只定界到该平台
             result.failed_sources.push("codex".into());
         }
     }
-    let scanned = scan_files(conn, files);
+    let scanned = scan_files(db, files);
     result.files_scanned = scanned.files_scanned;
     result.records_inserted = scanned.records_inserted;
     result.errors.extend(scanned.errors);
     result.failed_sources.extend(scanned.failed_sources);
-    let native=crate::native_sources::scan(conn);
-    result.files_scanned+=native.files_scanned;
-    result.records_inserted+=native.records_inserted;
-    result.errors.extend(native.errors);
-    result.failed_sources.extend(native.failed_sources);
+    if !native.is_empty() {
+        merge(&mut result, crate::native_sources::scan_changed(db, &native));
+    }
     result
 }
 
@@ -903,6 +940,23 @@ mod tests {
             let expected = if end.contains("turn_aborted") { "failed" } else { "done" };
             assert_eq!(state.activity_state.as_deref(), Some(expected), "结束事件状态错误：{end}");
         }
+    }
+
+    #[test]
+    fn heartbeat_prefilter_skips_only_files_that_are_fully_caught_up() {
+        let path = temp_jsonl("prefilter");
+        std::fs::write(&path, b"line\n").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let (size, mtime) = (meta.len() as i64, modified_ms(&meta));
+        let stamp = |offset, mtime, parser_initialized| db::ScanStamp { offset, mtime, parser_initialized };
+        assert!(needs_scan(&path, None), "没有位点的新文件必须扫描");
+        assert!(!needs_scan(&path, Some(&stamp(size, mtime, true))), "已追平且未改写的文件跳过");
+        assert!(needs_scan(&path, Some(&stamp(size - 1, mtime, true))), "有新字节");
+        assert!(needs_scan(&path, Some(&stamp(size + 1, mtime, true))), "文件被截断");
+        assert!(needs_scan(&path, Some(&stamp(size, mtime - 1, true))), "等长改写");
+        assert!(needs_scan(&path, Some(&stamp(size, mtime, false))), "旧版位点需重建解析上下文");
+        let _ = std::fs::remove_file(&path);
+        assert!(needs_scan(&path, Some(&stamp(size, mtime, true))), "读不到文件时交给采集报告错误");
     }
 
     #[test]

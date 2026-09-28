@@ -7,11 +7,11 @@
 //! 去抖：一次响应可能触发多次写事件（内容 + 元数据），
 //! 因此收到事件后合并 DEBOUNCE 窗口内的抖动，再做一次采集。
 
-use crate::db::LiveUsage;
-use crate::{collector, Cfg, Db};
+use crate::db::{LiveUsage, Store};
+use crate::{collector, Cfg, Db, DbRead};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -22,9 +22,15 @@ pub const EVENT_LIVE: &str = "live-usage";
 /// 写事件合并窗口。一次响应的多次写抖动合并成一次采集
 const DEBOUNCE: Duration = Duration::from_millis(120);
 
-/// 兜底心跳：监听失效（网络盘、权限、句柄耗尽）时仍能恢复。
-/// 正常情况下这条路径几乎不产生新增，开销可忽略。
+/// 兜底心跳：监听失效（网络盘、权限、句柄耗尽）时仍能恢复，并续期运行中会话的存活判定。
+/// 未变化的文件只比对大小与修改时间、不拿写锁，常态开销很小。
 const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// 每隔这么多次心跳整体重绑一次监听，覆盖底层句柄悄悄失效的情况；
+/// 其余心跳只补绑新出现或此前绑定失败的目录，不反复拆装全部递归监听。
+const FULL_REBIND_EVERY: u32 = 6;
+
+const PLATFORMS: [&str; 8] = ["claude", "codex", "gemini", "grok", "zcode", "trae", "qoder", "workbuddy"];
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
@@ -38,10 +44,9 @@ fn claude_registry() -> Option<PathBuf> {
         .map(|root| root.join("sessions"))
 }
 
-/// 重新绑定所有当前存在的来源。心跳时重复执行可覆盖目录晚出现、被删除后重建、
-/// 以及底层 watcher 丢失句柄的情况；紧接着仍会做一次全量增量扫描补齐空窗。
-fn rebind_sources(watcher: &mut RecommendedWatcher, announce: bool) {
-    let Some(home) = home() else { return };
+/// 监听目标：Claude / Codex 会话目录、Claude 进程登记、Codex 标题索引与各本机来源目录。
+fn watch_targets() -> Vec<(PathBuf, RecursiveMode)> {
+    let Some(home) = home() else { return Vec::new() };
     let codex_home = crate::session_titles::codex_home().unwrap_or_else(|| home.join(".codex"));
     let mut targets = vec![
         (home.join(".claude").join("projects"), RecursiveMode::Recursive),
@@ -49,27 +54,63 @@ fn rebind_sources(watcher: &mut RecommendedWatcher, announce: bool) {
         (codex_home.join("sessions"), RecursiveMode::Recursive),
         (codex_home.join("session_index.jsonl"), RecursiveMode::NonRecursive),
     ];
-    for platform in ["gemini","zcode","qoder","workbuddy"] {
-        for source in crate::native_sources::sources(platform) {
-            let path=if source.path.is_file() {source.path.parent().unwrap_or(&source.path).to_path_buf()} else {source.path};
-            targets.push((path,RecursiveMode::Recursive));
+    targets.extend(crate::native_sources::watch_roots().into_iter().map(|path| (path, RecursiveMode::Recursive)));
+    targets
+}
+
+/// 绑定监听。`full` 时拆掉重绑全部目标（覆盖底层 watcher 丢失句柄）；
+/// 否则只补绑尚未成功绑定、以及已被删除需要解绑的目标。`bound` 记录当前生效的目标。
+fn rebind_sources(watcher: &mut RecommendedWatcher, bound: &mut HashSet<PathBuf>, full: bool, announce: bool) {
+    for (path, mode) in watch_targets() {
+        let exists = path.exists();
+        if !full && exists == bound.contains(&path) {
+            continue;
         }
-    }
-    for (path, mode) in targets {
-        let _ = watcher.unwatch(&path);
-        if !path.exists() {
+        if bound.remove(&path) {
+            let _ = watcher.unwatch(&path);
+        }
+        if !exists {
             continue;
         }
         match watcher.watch(&path, mode) {
-            Ok(()) if announce => println!("[实时] 已监听 {}", path.display()),
-            Ok(()) => {}
+            Ok(()) => {
+                bound.insert(path.clone());
+                if announce { println!("[实时] 已监听 {}", path.display()); }
+            }
             Err(error) => eprintln!("[实时] 监听 {} 失败，将由心跳重试: {error}", path.display()),
         }
     }
 }
 
+/// 写事件路径是否值得采集：会话日志（jsonl）、Claude 进程登记，或本机来源目录里的
+/// 数据文件。SQLite 的共享内存文件（-shm）在只读打开时也会变化，排除以免自我触发。
+fn relevant(path: &Path, registry: Option<&Path>, native_roots: &[PathBuf]) -> bool {
+    if path.to_string_lossy().ends_with("-shm") {
+        return false;
+    }
+    path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        || registry.is_some_and(|root| path == root || path.parent() == Some(root))
+        || native_roots.iter().any(|root| path.starts_with(root))
+}
+
+/// 自 `since` 以来有新增或更正的平台。游标是全局事件序号，删除（如 Gemini 回退）
+/// 只推进序号不留事件，此时无法定位平台，按全部平台处理。
+fn changed_platforms(reader: &crate::ReadPool, since: Option<i64>, inserted: bool) -> BTreeSet<String> {
+    let all = || PLATFORMS.iter().map(|platform| platform.to_string()).collect();
+    let Some(since) = since else {
+        return if inserted { all() } else { BTreeSet::new() };
+    };
+    let found = reader.with(|conn| -> rusqlite::Result<BTreeSet<String>> {
+        let mut stmt = conn.prepare_cached("SELECT DISTINCT platform FROM usage_events WHERE id > ?1")?;
+        let rows = stmt.query_map([since], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }).unwrap_or_default();
+    if found.is_empty() && inserted { all() } else { found }
+}
+
 /// 采集一次并把最新实时用量推给前端。
 /// `cursor` 为上次推送时的最大 id，只有真的有新增才发事件。
+/// 采集按文件短暂持有写锁；实时快照走只读连接，不与界面查询和后续写入互相等待。
 fn collect_and_emit(
     app: &AppHandle,
     cursor: &mut Option<i64>,
@@ -78,16 +119,17 @@ fn collect_and_emit(
     changed_paths: Option<Vec<PathBuf>>,
 ) {
     let Some(state) = app.try_state::<Db>() else { return };
-    let Ok(mut conn) = state.0.lock() else { return };
+    let Some(reader) = app.try_state::<DbRead>() else { return };
+    let mut writer: &std::sync::Mutex<rusqlite::Connection> = &state.0;
 
     let previous_cursor = *cursor;
     let scan = match changed_paths {
-        Some(paths) => collector::scan_paths(&mut conn, paths),
-        None => collector::scan(&mut conn),
+        Some(paths) => collector::scan_paths(&mut writer, paths),
+        None => collector::scan(&mut writer),
     };
     crate::emit_collection_status(app, &scan);
     // 本地代理的计时可能在请求记录入库前到达，扫描后按去重键补写（无队列时零开销）
-    crate::proxy::flush_pending(&conn);
+    writer.write(|conn| crate::proxy::flush_pending(conn));
 
     // 跟随灵动岛配置的平台（§7.3），与托盘子菜单同一个值
     let settings = app
@@ -96,7 +138,7 @@ fn collect_and_emit(
         .unwrap_or_default();
     let platform = settings.island_platform;
 
-    let usage: LiveUsage = match crate::session_presence::live_usage(&conn, &platform, *cursor) {
+    let mut usage: LiveUsage = match reader.0.with(|conn| crate::session_presence::live_usage(conn, &platform, *cursor)) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("[实时] 查询失败: {e}");
@@ -115,20 +157,26 @@ fn collect_and_emit(
     // 会话刚刚全部结束（前端据此收起数字，漏掉这条数字就会一直挂着）
     let should = first || advanced || active || *had_active || today_changed || scan.records_inserted > 0;
     *had_active = active;
-
-    if should {
-        if advanced && !first {
-            println!("[实时] +{} token → 前端", usage.delta_tokens);
-        }
-        let _ = app.emit(EVENT_LIVE, &usage);
-        if scan.records_inserted > 0 {
-            for other in ["claude","codex","gemini","grok","zcode","trae","qoder","workbuddy"] {
-                if other != platform {
-                    if let Ok(snapshot) = crate::session_presence::live_usage(&conn,other,previous_cursor) {
-                        let _ = app.emit(EVENT_LIVE,&snapshot);
-                    }
-                }
-            }
+    if !should {
+        return;
+    }
+    // 游标是全局的：别的平台有新增也会前进。只有本平台真有变化，统计视图才需要重查；
+    // 仅为续期运行中会话的心跳推送不触发统计重查。
+    let changed = if advanced || scan.records_inserted > 0 {
+        changed_platforms(&reader.0, previous_cursor, scan.records_inserted > 0)
+    } else {
+        BTreeSet::new()
+    };
+    usage.data_changed = first || today_changed || changed.contains(&platform);
+    if advanced && !first {
+        println!("[实时] +{} token → 前端", usage.delta_tokens);
+    }
+    let _ = app.emit(EVENT_LIVE, &usage);
+    // 其他平台只推真正有变化的，供主面板对应视图刷新
+    for other in changed.iter().filter(|other| **other != platform) {
+        if let Ok(mut snapshot) = reader.0.with(|conn| crate::session_presence::live_usage(conn, other, previous_cursor)) {
+            snapshot.data_changed = true;
+            let _ = app.emit(EVENT_LIVE, &snapshot);
         }
     }
 }
@@ -143,20 +191,19 @@ pub fn start(app: AppHandle) {
         let pending_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let callback_paths = pending_paths.clone();
         let registry = claude_registry();
+        let native_roots = crate::native_sources::watch_roots();
 
         // notify 的 watcher 必须在整个监听期间存活，故绑定到本线程局部变量
         let mut watcher: Option<RecommendedWatcher> =
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     let relevant_kind = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_));
-                    let relevant_path = event.paths.iter().any(|path| {
-                        path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-                            || registry.as_ref().is_some_and(|root| path == root || path.parent() == Some(root.as_path()))
-                    });
+                    let relevant_path = event.paths.iter().any(|path| relevant(path, registry.as_deref(), &native_roots));
                     if relevant_kind && relevant_path {
                         if let Ok(mut pending) = callback_paths.lock() {
+                            // 进程登记只触发一次实时快照重算，不作为待采集文件
                             pending.extend(event.paths.into_iter().filter(|path| {
-                                path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+                                relevant(path, None, &native_roots)
                             }));
                         }
                         let _ = tx.try_send(());
@@ -170,9 +217,11 @@ pub fn start(app: AppHandle) {
                 }
             };
 
+        let mut bound = HashSet::new();
         if let Some(watcher) = watcher.as_mut() {
-            rebind_sources(watcher, true);
+            rebind_sources(watcher, &mut bound, true, true);
         }
+        let mut heartbeats = 0u32;
 
         let mut cursor: Option<i64> = None;
         let mut had_active = false;
@@ -201,7 +250,8 @@ pub fn start(app: AppHandle) {
                     }
                 }
             } else if let Some(watcher) = watcher.as_mut() {
-                rebind_sources(watcher, false);
+                heartbeats = heartbeats.wrapping_add(1);
+                rebind_sources(watcher, &mut bound, heartbeats % FULL_REBIND_EVERY == 0, false);
             }
 
             let changed_paths = if got {
@@ -244,7 +294,10 @@ fn config_targets() -> Vec<PathBuf> {
 fn sync_connections_and_emit(app: &AppHandle) {
     let Some(state) = app.try_state::<Db>() else { return };
     let Ok(mut conn) = state.0.lock() else { return };
-    match crate::connections::sync_from_local(&mut conn) {
+    let synced = crate::connections::sync_from_local(&mut conn);
+    // 代理跟随配置时可能要写库（proxy::on_config_changed），先释放写锁
+    drop(conn);
+    match synced {
         Ok(true) => {
             println!("[连接] 本机配置有变化，已自动更新连接并触发重查");
             let _ = app.emit("connections-changed", ());

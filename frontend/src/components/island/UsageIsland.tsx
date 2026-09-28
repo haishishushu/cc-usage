@@ -1,5 +1,5 @@
 import { useId, useState } from "react"
-import { IslandConnectionSwitcher } from "./IslandConnectionSwitcher"
+import { LazyConnectionSwitcher } from "./LazyConnectionSwitcher"
 import { cn } from "@/lib/utils"
 import { SHIMMER_CYCLE_MS, SHIMMER_MIN_CYCLES, useCycleExit } from "@/lib/motion"
 import { authQuotaRows } from "@/lib/authQuotaRows"
@@ -55,6 +55,8 @@ export interface IslandData {
   deltaText?: string | null
   /** 实时累计增量数值；有值时数字带补间动画，优先于 deltaText */
   deltaTokens?: number | null
+  /** 实时追数键：数值由叶子组件从 LiveCountsContext 订阅，追数期间岛体不逐帧重渲染 */
+  deltaCountKey?: string
   deltaPhase?: DeltaPhase
   todayTokenText?: string | null
   sourceText?: string
@@ -190,6 +192,7 @@ export function IslandCollapsed({
         <TokenDelta
           text={data.unavailable ? "—" : (data.deltaText ?? null)}
           tokens={data.unavailable ? null : data.deltaTokens}
+          countKey={data.unavailable ? undefined : data.deltaCountKey}
           phase={data.deltaPhase ?? "hold"}
         />
       </div>
@@ -270,7 +273,7 @@ export function IslandExpanded({
     <Shell onDoubleClick={onCollapse} minHeight={connectionMenuOpen ? 240 : undefined} refreshKey={refreshKey} refreshing={refreshing}>
       <div className="flex w-full items-center justify-between">
         <PlatformHead data={data} />
-        {connectionSwitcher ?? <IslandConnectionSwitcher />}
+        {connectionSwitcher ?? <LazyConnectionSwitcher />}
       </div>
 
       <Divider />
@@ -326,14 +329,14 @@ export function IslandExpanded({
         </div>
       )}
 
-      {(sessionTotal > 0 || data.deltaTokens != null) && (
+      {(sessionTotal > 0 || data.deltaTokens != null || (data.deltaCountKey != null && data.deltaPhase !== "idle")) && (
         <>
           <Divider />
           <div className="flex w-full items-center justify-between">
             <span className="text-xs font-medium text-text-primary">
               {sessionTotal > 0 ? (data.sessionSectionTitle ?? `运行中的会话 · ${sessionTotal}`) : "本轮 Token"}
             </span>
-            <AnimatedTokens tokens={data.deltaTokens} text={data.deltaText} />
+            <AnimatedTokens tokens={data.deltaTokens} text={data.deltaText} countKey={data.deltaCountKey} />
           </div>
           {sessionTotal > 0 && <SessionList sessions={data.sessions!} showUnknownTag={data.sessionStatusUnknown} />}
         </>

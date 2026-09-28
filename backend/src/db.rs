@@ -40,7 +40,50 @@ pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    tune(&conn)?;
     init(&conn)?;
+    // 长连接按官方建议在打开时做一次有上限的统计更新，让新索引立刻被规划器采用。
+    let _ = conn.execute_batch("PRAGMA analysis_limit=400; PRAGMA optimize=0x10002;");
+    Ok(conn)
+}
+
+/// 采集写入的数据库入口。后台采集按文件短暂持有写锁、文件之间让出，
+/// 用户操作（添加连接、清理数据等）不必等整轮扫描结束；测试直接传连接。
+pub trait Store {
+    fn write<R>(&mut self, work: impl FnOnce(&mut Connection) -> R) -> R;
+}
+
+impl Store for Connection {
+    fn write<R>(&mut self, work: impl FnOnce(&mut Connection) -> R) -> R {
+        work(self)
+    }
+}
+
+impl Store for &std::sync::Mutex<Connection> {
+    fn write<R>(&mut self, work: impl FnOnce(&mut Connection) -> R) -> R {
+        let mut conn = self.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        work(&mut conn)
+    }
+}
+
+/// 读写连接共用的调优：页缓存放得下整库常用页，临时排序走内存；
+/// 读写分离后多个连接并发访问，写锁冲突时等待而不是立即报 busy。
+fn tune(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "cache_size", -16_000)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // 采集写入路径的语句都走 prepare_cached；默认 16 条会在一轮扫描里互相挤出缓存。
+    conn.set_prepared_statement_cache_capacity(64);
+    Ok(())
+}
+
+/// 只读查询连接：统计、日志与实时快照走这里，不与采集写入争同一把锁。
+/// WAL 模式下读者看到的是最近一次提交的一致快照；`query_only` 防止误写。
+/// 必须在 [`open`] 完成建表与迁移之后再打开。
+pub fn open_reader(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    tune(&conn)?;
+    conn.pragma_update(None, "query_only", true)?;
     Ok(conn)
 }
 
@@ -74,6 +117,8 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         -- 日志按时间倒序分页、汇总按平台+区间过滤，两个索引对应这两类查询
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts DESC);
         CREATE INDEX IF NOT EXISTS idx_requests_platform_ts ON requests(platform, ts DESC);
+        -- 实时快照按会话取首次时间、清理按会话判断是否仍有记录；缺它会逐会话扫全平台
+        CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(platform, session_id, ts);
 
         -- 请求级最终值之外，单独记录每次新增的正向差额；同一个流式请求
         -- 多次更新时统计表保留最终值，实时游标仍能看到后续差额。
@@ -88,6 +133,9 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_usage_events_platform_id ON usage_events(platform, id);
         CREATE INDEX IF NOT EXISTS idx_usage_events_session_ts ON usage_events(platform, session_id, ts);
+        -- 启动时的基线事件回填按 request_id 做 NOT EXISTS；缺这个索引会逐行全表扫描，
+        -- 两万多条记录就要十几秒，直接拖慢冷启动。
+        CREATE INDEX IF NOT EXISTS idx_usage_events_request ON usage_events(request_id);
 
         -- 会话标题：Claude Code 的 ai-title 行、Codex 的 session_index.jsonl
         CREATE TABLE IF NOT EXISTS sessions (
@@ -248,11 +296,28 @@ struct BackupFile {
 }
 
 pub fn get_scan_state(conn: &Connection, path: &str) -> Option<(i64, i64)> {
-    conn.query_row(
-        "SELECT offset, mtime FROM scan_state WHERE path = ?1",
-        params![path],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).ok()
+    conn.prepare_cached("SELECT offset, mtime FROM scan_state WHERE path = ?1").ok()?
+        .query_row(params![path], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()
+}
+
+/// 扫描位点的精简视图：心跳在锁外比对文件大小与修改时间，只把真正变化的文件交给采集。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanStamp {
+    pub offset: i64,
+    pub mtime: i64,
+    pub parser_initialized: bool,
+}
+
+/// 一次读出全部位点，代替逐文件查询。
+pub fn scan_stamps(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, ScanStamp>> {
+    let mut stmt = conn.prepare_cached("SELECT path, offset, mtime, parser_initialized FROM scan_state")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, ScanStamp {
+        offset: row.get(1)?,
+        mtime: row.get(2)?,
+        parser_initialized: row.get::<_, i32>(3)? != 0,
+    })))?;
+    rows.collect()
 }
 
 #[derive(Default)]
@@ -269,11 +334,12 @@ pub struct ScanCheckpoint {
 }
 
 pub fn get_scan_checkpoint(conn: &Connection, path: &str) -> Option<ScanCheckpoint> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT offset, mtime, parser_model, parser_session_id,
                 parser_activity_state, parser_updated_at_ms, parser_initialized,
                 parser_effort
          FROM scan_state WHERE path = ?1",
+    ).ok()?.query_row(
         params![path],
         |row| Ok(ScanCheckpoint {
             offset: row.get(0)?,
@@ -293,7 +359,7 @@ pub fn set_scan_checkpoint(
     path: &str,
     checkpoint: &ScanCheckpoint,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO scan_state(
              path, offset, mtime, parser_model, parser_session_id,
              parser_activity_state, parser_updated_at_ms, parser_initialized,
@@ -308,6 +374,7 @@ pub fn set_scan_checkpoint(
              parser_updated_at_ms = excluded.parser_updated_at_ms,
              parser_initialized = excluded.parser_initialized,
              parser_effort = excluded.parser_effort",
+    )?.execute(
         params![
             path,
             checkpoint.offset,
@@ -358,11 +425,12 @@ fn insert_records_into(conn: &Connection, recs: &[RequestRecord]) -> rusqlite::R
     }
     let mut changed = 0usize;
     for r in recs {
-        let previous = conn.query_row(
+        let previous = conn.prepare_cached(
             "SELECT id, input_tokens, output_tokens, cache_read_tokens,
                     cache_write_tokens, total_tokens, input_known, output_known,
                     cache_read_known, cache_write_known, total_known
              FROM requests WHERE source = ?1 AND dedup_key = ?2",
+        )?.query_row(
             params![r.source, r.dedup_key],
             |row| Ok((
                 row.get::<_, i64>(0)?,
@@ -387,13 +455,14 @@ fn insert_records_into(conn: &Connection, recs: &[RequestRecord]) -> rusqlite::R
             let next_fresh = fresh_tokens(&r.platform, next[0].0, next[1].0, next[2].0, next[3].0);
             let delta_fresh = (next_fresh - old_fresh).max(0);
             if next.iter().enumerate().any(|(index, value)| value.0 != old[index] || value.1 != known[index]) {
-                conn.execute(
+                conn.prepare_cached(
                     "UPDATE requests SET session_id = COALESCE(?2, session_id), ts = MAX(ts, ?3),
                         model = COALESCE(?4, model), input_tokens = ?5, output_tokens = ?6,
                         cache_read_tokens = ?7, cache_write_tokens = ?8, total_tokens = ?9,
                         input_known = ?10, output_known = ?11, cache_read_known = ?12,
                         cache_write_known = ?13, total_known = ?14
                      WHERE id = ?1",
+                )?.execute(
                     params![id, r.session_id, r.ts, r.model,
                         next[0].0, next[1].0, next[2].0, next[3].0, next[4].0,
                         next[0].1 as i32, next[1].1 as i32, next[2].1 as i32,
@@ -403,12 +472,13 @@ fn insert_records_into(conn: &Connection, recs: &[RequestRecord]) -> rusqlite::R
             }
             (id, delta.max(0), delta_fresh)
         } else {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO requests
                  (platform, source, dedup_key, session_id, ts, model,
                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                   input_known, output_known, cache_read_known, cache_write_known, total_known, effort)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            )?.execute(
                 params![r.platform, r.source, r.dedup_key, r.session_id, r.ts, r.model,
                     r.input_tokens.unwrap_or(0), r.output_tokens.unwrap_or(0),
                     r.cache_read_tokens.unwrap_or(0), r.cache_write_tokens.unwrap_or(0),
@@ -428,9 +498,10 @@ fn insert_records_into(conn: &Connection, recs: &[RequestRecord]) -> rusqlite::R
                 ))
         };
         if delta_total > 0 || delta_fresh > 0 {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO usage_events(request_id, platform, session_id, ts, delta_total, delta_fresh)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?.execute(
                 params![request_id, r.platform, r.session_id, r.ts, delta_total, delta_fresh],
             )?;
         }
@@ -701,12 +772,11 @@ pub fn upsert_session_title(
     session_id: &str,
     title: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO sessions(platform, session_id, title) VALUES(?1,?2,?3)
          ON CONFLICT(platform, session_id) DO UPDATE SET title = ?3
          WHERE sessions.title IS NOT excluded.title",
-        params![platform, session_id, title],
-    )?;
+    )?.execute(params![platform, session_id, title])?;
     Ok(())
 }
 
@@ -718,7 +788,7 @@ pub fn set_session_activity(
     updated_at_ms: i64,
 ) -> rusqlite::Result<()> {
     let state = if matches!(state, "running" | "done" | "failed" | "unknown" | "waiting") { state } else { "unknown" };
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO sessions(platform, session_id, is_running, activity_state, activity_updated_ms)
          VALUES(?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(platform, session_id) DO UPDATE SET
@@ -727,8 +797,7 @@ pub fn set_session_activity(
            activity_updated_ms = excluded.activity_updated_ms
          WHERE sessions.activity_updated_ms IS NULL
             OR excluded.activity_updated_ms >= sessions.activity_updated_ms",
-        params![platform, session_id, (state == "running") as i32, state, updated_at_ms],
-    )?;
+    )?.execute(params![platform, session_id, (state == "running") as i32, state, updated_at_ms])?;
     Ok(())
 }
 
@@ -772,6 +841,9 @@ pub struct LiveUsage {
     pub realtime_delta: bool,
     /// 首次加载：调用方不得据此播放增量动画（§2.1.1）
     pub initial: bool,
+    /// 本平台的统计数据自上次推送以来有变化。仅为续期运行中会话的心跳推送为 false，
+    /// 主面板等统计视图据此跳过无意义的重查；主动查询的快照恒为 false。
+    pub data_changed: bool,
 }
 
 /// 尚无可信生命周期来源的“最近活跃”窗口，不得将它显示成运行状态。
@@ -976,6 +1048,7 @@ pub fn live_usage(
         today_tokens,
         realtime_delta,
         initial: since.is_none(),
+        data_changed: false,
     })
 }
 
@@ -1154,11 +1227,28 @@ pub fn token_totals_at(
         conn.query_row(&sql, rusqlite::params_from_iter(filter.params(&[start, end])), |r| r.get(0))
     };
 
-    let mut out = [Some(0i64); 4];
-    for (i, period) in ["today", "week", "month", "total"].iter().enumerate() {
-        let (start, end) = period_range_at(conn, platform, period, query_end_ms);
-        out[i] = sum_range(start, end)?;
-    }
+    // 四个周期共用一次扫描：累计的起点就是该平台最早记录，等价于结束时刻之前的全部记录；
+    // 今日 / 本周 / 本月用条件聚合在同一批行里分别求和，口径与逐段查询一致。
+    let empty = if crate::platforms::native(platform) { "NULL" } else { "0" };
+    let starts = ["today", "week", "month"].map(|period| period_range_at(conn, platform, period, query_end_ms).0);
+    let within = |slot: usize| format!(
+        "CASE WHEN COUNT(CASE WHEN ts >= ?{slot} THEN 1 END) = 0 THEN {empty}
+              WHEN MIN(CASE WHEN ts >= ?{slot} THEN total_known END) = 1
+                THEN SUM(CASE WHEN ts >= ?{slot} THEN total_tokens END)
+              ELSE NULL END"
+    );
+    let filter = Filter::new(platform, model, 5);
+    let sql = format!(
+        "SELECT {}, {}, {},
+                CASE WHEN COUNT(*) = 0 THEN {empty} WHEN MIN(total_known) = 1 THEN SUM(total_tokens) ELSE NULL END
+         FROM requests WHERE ts < ?1{EXCLUDE_DEGENERATE_SQL}{}",
+        within(2), within(3), within(4), filter.clause
+    );
+    let out: [Option<i64>; 4] = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(filter.params(&[query_end_ms, starts[0], starts[1], starts[2]])),
+        |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]),
+    )?;
 
     // 自定义区间与四个预设周期并列返回，界面切到「自定义时间」时用它
     let custom_total = match custom {
@@ -1229,6 +1319,11 @@ const FRESH_INPUT_SQL: &str =
 const FRESH_INPUT_KNOWN_SQL: &str =
     "CASE input_semantics WHEN 'includes_cache' THEN input_known * cache_read_known WHEN 'excludes_cache' THEN input_known ELSE 0 END";
 
+/// 命中率分母是「本可以命中的输入」：新增输入 + 缓存写入 + 缓存命中。
+/// 任一分量未知则整个比率未知——用已知的部分凑一个分母会低估分母、高估命中率。
+const HIT_DENOMINATOR_KNOWN_SQL: &str = "CASE input_semantics      WHEN 'includes_cache' THEN input_known * cache_read_known      WHEN 'excludes_cache' THEN input_known * cache_read_known * cache_write_known ELSE 0 END";
+const HIT_DENOMINATOR_SQL: &str = "CASE input_semantics WHEN 'includes_cache' THEN input_tokens      WHEN 'excludes_cache' THEN input_tokens + cache_read_tokens + cache_write_tokens END";
+
 /// 退化行排除（2026-09-19 鼠鼠定版）：已知 Token 字段全为 0 却缺任一缓存字段的
 /// 记录——实测来自第三方网关的空响应（usage 只有 input/output 两个 0）——本身
 /// 不携带可统计信息，却会让区间的合计、命中率与费用整体变「未知」。统计聚合
@@ -1253,7 +1348,8 @@ pub fn usage_breakdown_at(
                 MIN({FRESH_INPUT_KNOWN_SQL}), MIN(output_known), MIN(cache_write_known),
                 MIN(cache_read_known), MIN(total_known),
                 SUM({FRESH_INPUT_SQL}), SUM(output_tokens), SUM(cache_write_tokens),
-                SUM(cache_read_tokens), SUM(total_tokens)
+                SUM(cache_read_tokens), SUM(total_tokens),
+                MIN({HIT_DENOMINATOR_KNOWN_SQL}), SUM({HIT_DENOMINATOR_SQL})
          FROM requests WHERE ts >= ?1 AND ts < ?2{EXCLUDE_DEGENERATE_SQL}{}",
         filter.clause
     );
@@ -1274,10 +1370,12 @@ pub fn usage_breakdown_at(
                     r.get::<_, Option<i64>>(9)?,
                     r.get::<_, Option<i64>>(10)?,
                 ),
+                // 命中率分母与分项同一次扫描取出，不再单独扫一遍区间
+                (r.get::<_, Option<i64>>(11)? == Some(1)).then(|| r.get::<_, Option<i64>>(12)).transpose()?.flatten(),
             ))
         },
     )?;
-    let (requests, (fi_known, o_known, cw_known, cr_known, t_known), (fi, o, cw, cr, total)) = row;
+    let (requests, (fi_known, o_known, cw_known, cr_known, t_known), (fi, o, cw, cr, total), denominator) = row;
 
     // 没有任何记录时四项都是真实的 0，不是未知：区间内确实没用过。
     let at = |known: bool, value: Option<i64>| -> Option<i64> {
@@ -1295,16 +1393,6 @@ pub fn usage_breakdown_at(
     let cache_read = at(cr_known, cr);
     let real_total = at(t_known, total);
 
-    // 命中率分母是「本可以命中的输入」：新增输入 + 缓存写入 + 缓存命中。
-    // 任一分量未知则整个比率未知——用已知的部分凑一个分母会低估分母、高估命中率。
-    let denominator_sql = format!("SELECT CASE WHEN MIN(CASE input_semantics
-        WHEN 'includes_cache' THEN input_known * cache_read_known
-        WHEN 'excludes_cache' THEN input_known * cache_read_known * cache_write_known ELSE 0 END)=1
-        THEN SUM(CASE input_semantics WHEN 'includes_cache' THEN input_tokens
-          WHEN 'excludes_cache' THEN input_tokens+cache_read_tokens+cache_write_tokens END) END
-        FROM requests WHERE ts>=?1 AND ts<?2{EXCLUDE_DEGENERATE_SQL}{}", filter.clause);
-    let denominator:Option<i64> = conn.query_row(&denominator_sql,
-        rusqlite::params_from_iter(filter.params(&[start,end])), |r|r.get(0))?;
     let cache_hit_rate = cache_read.zip(denominator).and_then(|(r,d)| (d>0 && r<=d).then_some(r as f64/d as f64));
     let avg_per_request = match real_total {
         Some(t) if requests > 0 => Some(t as f64 / requests as f64),

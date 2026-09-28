@@ -1,16 +1,17 @@
 @import "tailwindcss";
 
-/* pencil-new.pen 字体离线分发，不依赖系统安装或运行时联网。 */
+/* pencil-new.pen 字体离线分发，不依赖系统安装或运行时联网。
+   只保留拉丁、标点、箭头与数学符号子集（woff2）；中文与子集外字符按字形回退到系统字体。 */
 @font-face {
   font-family: "Inter";
-  src: url("/fonts/Inter-Variable.ttf") format("truetype");
+  src: url("/fonts/Inter-Variable.woff2") format("woff2");
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
 }
 @font-face {
   font-family: "JetBrains Mono";
-  src: url("/fonts/JetBrainsMono-Variable.ttf") format("truetype");
+  src: url("/fonts/JetBrainsMono-Variable.woff2") format("woff2");
   font-style: normal;
   font-weight: 100 800;
   font-display: swap;

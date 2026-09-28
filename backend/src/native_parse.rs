@@ -1,6 +1,7 @@
 //! 原生应用白名单用量字段。只保存统计，不复制提示词、工具参数或凭证。
 use crate::{db::RequestRecord, source_store::Record};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn num(v: &Value, key: &str) -> Option<i64> {
     v.get(key)?.as_i64().filter(|n| *n >= 0)
@@ -176,12 +177,24 @@ pub fn gemini_message(v: &Value, source: &str, session: &str) -> Option<Record> 
 pub fn gemini_records(lines: &[Value], source: &str) -> Vec<Record> {
     let mut session = String::new();
     let mut messages: Vec<Value> = Vec::new();
+    // 消息 ID → 首次出现的位置。长会话逐行线性查找是平方级，改为哈希定位。
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let reindex = |messages: &[Value]| {
+        let mut positions = HashMap::new();
+        for (index, message) in messages.iter().enumerate() {
+            if let Some(id) = text(message, "id") {
+                positions.entry(id.to_string()).or_insert(index);
+            }
+        }
+        positions
+    };
     for line in lines {
         if let Some(id) = text(line, "sessionId") {
             session = id.into();
         }
         if let Some(all) = line.get("messages").and_then(Value::as_array) {
             messages = all.clone();
+            positions = reindex(&messages);
             continue;
         }
         if let Some(set) = line.get("$set") {
@@ -190,21 +203,21 @@ pub fn gemini_records(lines: &[Value], source: &str) -> Vec<Record> {
             }
             if let Some(all) = set.get("messages").and_then(Value::as_array) {
                 messages = all.clone();
+                positions = reindex(&messages);
             }
             continue;
         }
         if let Some(target) = text(line, "$rewindTo") {
-            let index = messages
-                .iter()
-                .position(|m| text(m, "id") == Some(target))
-                .unwrap_or(0);
+            let index = positions.get(target).copied().unwrap_or(0);
             messages.truncate(index);
+            positions.retain(|_, position| *position < index);
             continue;
         }
         if let Some(id) = text(line, "id") {
-            if let Some(index) = messages.iter().position(|m| text(m, "id") == Some(id)) {
+            if let Some(&index) = positions.get(id) {
                 messages[index] = line.clone();
             } else {
+                positions.insert(id.to_string(), messages.len());
                 messages.push(line.clone());
             }
         }

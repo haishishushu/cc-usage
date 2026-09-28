@@ -11,9 +11,10 @@ import { Pagination } from "@/components/panel/Pagination"
 import { BalanceCard } from "@/components/panel/BalanceCard"
 import { useToast } from "@/components/ui/Toast"
 import { DateRangePicker } from "@/components/panel/DateRangePicker"
-import { grouped, isTauri, listenEvent, type BalanceStateDto, type CustomRange, type LiveUsageDto, type QuotaStateDto } from "@/lib/api"
+import { grouped, isTauri, listenEvent, type BalanceStateDto, type CustomRange, type QuotaStateDto } from "@/lib/api"
 import { useConnections } from "@/lib/useConnections"
 import { shouldRefreshConnection } from "@/lib/refreshScope"
+import { onUsageChanged } from "@/lib/usageChanges"
 import { useApiUsage, useBalance, useCostEstimate, useQuota } from "@/lib/useQuota"
 import { toQuotaWindows } from "@/lib/quotaMap"
 import { authQuotaRows } from "@/lib/authQuotaRows"
@@ -231,9 +232,8 @@ export function OverviewView({
       if (shouldRefreshConnection(connectionId, selectedConnectionId)) setRefreshKey((value) => value + 1)
     })
       .then((off) => stopped ? off() : offs.push(off))
-    void listenEvent<LiveUsageDto>("live-usage", (usage) => {
-      if (usage.platform === platform) setRefreshKey((value) => value + 1)
-    }).then((off) => stopped ? off() : offs.push(off))
+    // 只有本平台统计真有变化才重查（续期心跳不算），流式输出期间的连续变化合并刷新
+    offs.push(onUsageChanged(platform, () => setRefreshKey((value) => value + 1)))
     return () => { stopped = true; offs.forEach((off) => off()) }
   }, [platform, panelActive, selectedConnectionId])
 
@@ -270,12 +270,13 @@ export function OverviewView({
       }
     : BALANCE
 
-  const chartSeries = chart.series.map((series) => series.key === "cache_write"
+  // 引用只随趋势数据变化：图表内悬停不会因为这里每次渲染都换新数组而重算全部路径
+  const chartSeries = useMemo(() => chart.series.map((series) => series.key === "cache_write"
     ? { ...series, values: series.values.map((value, index) => cacheWriteDisplayValue(
         platform, effectiveVariant, value,
         chart.series.some((other) => other.key !== "cache_write" && (other.values[index] ?? 0) > 0),
       )) }
-    : series)
+    : series), [chart.series, platform, effectiveVariant])
 
   return (
     <div className="flex w-full flex-col gap-7 p-8">

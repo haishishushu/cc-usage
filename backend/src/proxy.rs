@@ -262,9 +262,11 @@ impl ProxyDeps {
         let Some(dedup_key) = extract_dedup_key(platform, head) else {
             return;
         };
-        let applied = {
-            let Ok(conn) = self.db.lock() else { return };
-            crate::db::apply_proxy_timing(&conn, &dedup_key, first, duration, status).unwrap_or(0)
+        // 这里跑在转发流的异步任务里：写锁被采集占用时不阻塞运行时线程，
+        // 直接转入待关联队列，由采集下一轮扫描后补写（flush_pending）。
+        let applied = match self.db.try_lock() {
+            Ok(conn) => crate::db::apply_proxy_timing(&conn, &dedup_key, first, duration, status).unwrap_or(0),
+            Err(_) => 0,
         };
         if applied == 0 {
             if let Ok(mut queue) = self.pending.lock() {

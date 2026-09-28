@@ -48,24 +48,27 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     ")
 }
 
+/// 清理历史后的采集下限：早于它的记录不再重新入库。
+fn cutoff(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.prepare_cached("SELECT cutoff_ms FROM collection_policy WHERE singleton=1")?
+        .query_row([], |r| r.get(0))
+}
+
 pub fn write(conn: &Connection, records: &[Record]) -> rusqlite::Result<usize> {
     let mut changed = 0;
-    let cutoff: i64 = conn.query_row(
-        "SELECT cutoff_ms FROM collection_policy WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )?;
+    let cutoff = cutoff(conn)?;
     for item in records {
         let r = &item.request;
         if r.ts < cutoff {
             continue;
         }
-        let old: Option<(i64, Option<i64>, Option<i64>)> = conn.query_row(
+        let old: Option<(i64, Option<i64>, Option<i64>)> = conn.prepare_cached(
             "SELECT id, CASE WHEN total_known=1 THEN total_tokens END,
              CASE WHEN input_known=1 AND output_known=1 THEN
                CASE input_semantics WHEN 'includes_cache' THEN CASE WHEN cache_read_known=1 THEN max(input_tokens-cache_read_tokens,0)+output_tokens END
                  WHEN 'excludes_cache' THEN input_tokens+output_tokens END END
              FROM requests WHERE source=?1 AND dedup_key=?2",
+        )?.query_row(
             params![r.source, r.dedup_key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         ).optional()?;
         let incoming = [
@@ -75,7 +78,7 @@ pub fn write(conn: &Connection, records: &[Record]) -> rusqlite::Result<usize> {
             r.cache_write_tokens,
             r.total_tokens,
         ];
-        let count = conn.execute("INSERT INTO requests(platform,source,dedup_key,session_id,ts,model,
+        let count = conn.prepare_cached("INSERT INTO requests(platform,source,dedup_key,session_id,ts,model,
             input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,
             input_known,output_known,cache_read_known,cache_write_known,total_known,effort,input_semantics)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
@@ -91,18 +94,19 @@ pub fn write(conn: &Connection, records: &[Record]) -> rusqlite::Result<usize> {
             IS NOT (excluded.session_id,excluded.ts,excluded.model,excluded.input_tokens,excluded.output_tokens,
               excluded.cache_read_tokens,excluded.cache_write_tokens,excluded.total_tokens,excluded.input_known,
               excluded.output_known,excluded.cache_read_known,excluded.cache_write_known,excluded.total_known,
-              excluded.effort,excluded.input_semantics)", params![r.platform,r.source,r.dedup_key,r.session_id,r.ts,r.model,
+              excluded.effort,excluded.input_semantics)")?.execute(params![r.platform,r.source,r.dedup_key,r.session_id,r.ts,r.model,
               incoming[0].unwrap_or(0),incoming[1].unwrap_or(0),incoming[2].unwrap_or(0),incoming[3].unwrap_or(0),incoming[4].unwrap_or(0),
               incoming[0].is_some(),incoming[1].is_some(),incoming[2].is_some(),incoming[3].is_some(),incoming[4].is_some(),r.effort,item.input_semantics])?;
         let id = match old {
             Some((id, _, _)) => id,
             None => conn.last_insert_rowid(),
         };
-        let metric_count = conn.execute("INSERT INTO request_metrics(request_id,credits,original_credits,billable,context_ratio,reasoning)
+        let metric_count = conn.prepare_cached("INSERT INTO request_metrics(request_id,credits,original_credits,billable,context_ratio,reasoning)
             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(request_id) DO UPDATE SET credits=excluded.credits,
             original_credits=excluded.original_credits,billable=excluded.billable,context_ratio=excluded.context_ratio,reasoning=excluded.reasoning
             WHERE (credits,original_credits,billable,context_ratio,reasoning) IS NOT
               (excluded.credits,excluded.original_credits,excluded.billable,excluded.context_ratio,excluded.reasoning)",
+        )?.execute(
             params![id,item.credits,item.original_credits,item.billable,item.context_ratio,item.reasoning])?;
         if count > 0 || metric_count > 0 {
             changed += 1;
@@ -119,8 +123,8 @@ pub fn write(conn: &Connection, records: &[Record]) -> rusqlite::Result<usize> {
         let delta = r.total_tokens.unwrap_or(0) - old.and_then(|o| o.1).unwrap_or(0);
         let delta_fresh = fresh.unwrap_or(0) - old.and_then(|o| o.2).unwrap_or(0);
         if delta != 0 || delta_fresh != 0 {
-            conn.execute("INSERT INTO usage_events(request_id,platform,session_id,ts,delta_total,delta_fresh) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![id,r.platform,r.session_id,r.ts,delta,delta_fresh])?;
+            conn.prepare_cached("INSERT INTO usage_events(request_id,platform,session_id,ts,delta_total,delta_fresh) VALUES(?1,?2,?3,?4,?5,?6)")?
+                .execute(params![id,r.platform,r.session_id,r.ts,delta,delta_fresh])?;
         }
     }
     Ok(changed)
@@ -148,18 +152,13 @@ pub fn context(conn: &Connection, value: &ContextSnapshot) -> rusqlite::Result<u
     if !value.ratio.is_finite() || !(0.0..=1.0).contains(&value.ratio) || value.ts <= 0 {
         return Ok(0);
     }
-    let cutoff: i64 = conn.query_row(
-        "SELECT cutoff_ms FROM collection_policy WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )?;
-    if value.ts < cutoff {
+    if value.ts < cutoff(conn)? {
         return Ok(0);
     }
-    conn.execute("INSERT INTO native_context(platform,source,session_id,model,ratio,ts) VALUES(?1,?2,?3,?4,?5,?6)
+    conn.prepare_cached("INSERT INTO native_context(platform,source,session_id,model,ratio,ts) VALUES(?1,?2,?3,?4,?5,?6)
         ON CONFLICT(source,session_id) DO UPDATE SET model=excluded.model,ratio=excluded.ratio,ts=excluded.ts
-        WHERE excluded.ts>=native_context.ts AND (model,ratio,ts) IS NOT (excluded.model,excluded.ratio,excluded.ts)",
-        params![value.platform,value.source,value.session_id,value.model,value.ratio,value.ts])
+        WHERE excluded.ts>=native_context.ts AND (model,ratio,ts) IS NOT (excluded.model,excluded.ratio,excluded.ts)")?
+        .execute(params![value.platform,value.source,value.session_id,value.model,value.ratio,value.ts])
 }
 
 pub fn contexts(

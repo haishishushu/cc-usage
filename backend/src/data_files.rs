@@ -41,7 +41,7 @@ pub async fn import_data_file(app: tauri::AppHandle, db: State<'_, super::Db>) -
 }
 
 #[tauri::command]
-pub async fn export_data_file(app: tauri::AppHandle, db: State<'_, super::Db>, platform: Option<String>) -> Result<Option<String>, String> {
+pub async fn export_data_file(app: tauri::AppHandle, db: State<'_, super::DbRead>, platform: Option<String>) -> Result<Option<String>, String> {
     if platform.as_deref().is_some_and(|p| !matches!(p, "claude" | "codex")) { return Err("导出范围无效".into()); }
     let window = app.get_webview_window(super::MAIN).ok_or("请从主面板导出数据")?;
     let name = format!("cc-usage-{}-{}.json", platform.as_deref().unwrap_or("all"), chrono::Local::now().format("%Y-%m-%d"));

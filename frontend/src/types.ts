@@ -85,6 +85,8 @@ export interface SessionActivity {
   title: string
   /** 当前会话的本轮累计或实时采集增量文本，如「+8.0K Token」 */
   deltaText: string
+  /** 实时追数键：有值时逐帧数值从 LiveCountsContext 订阅，优先于 deltaText */
+  countKey?: string
   state: "running" | "done" | "failed" | "unknown"
   updatedAtMs?: number
   startedAtMs?: number

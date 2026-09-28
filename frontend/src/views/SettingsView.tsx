@@ -242,6 +242,7 @@ function PlanQuerySection() {
   cfg,
   connectionPlatform,
   onConnectionPlatformChange,
+  panelActive,
 }: {
   onAdd: () => void
   onEdit: (c: Connection) => void
@@ -251,6 +252,7 @@ function PlanQuerySection() {
   /** 连接管理当前查看的平台 */
   connectionPlatform: PlatformId
   onConnectionPlatformChange: (platform: PlatformId) => void
+  panelActive: boolean
 }) {
   const theme = cfg.settings.theme === "system" ? "跟随系统" : cfg.settings.theme === "dark" ? "深色" : "浅色"
   const savePreferences = cfg.setDisplayPreferences
@@ -353,7 +355,7 @@ function PlanQuerySection() {
         <section className="flex w-full flex-col gap-3">
           <h3 className="text-xs font-semibold text-text-primary">指标预览</h3>
           <Hint>根据连接数自动扩充，每行两张；仅「使用中」连接驱动灵动岛。</Hint>
-          <ConnectionPreviews connections={conn.connections} selectedId={cfg.settings.island_connection_id} />
+          <ConnectionPreviews connections={conn.connections} selectedId={cfg.settings.island_connection_id} active={panelActive} />
         </section>
       </section>
 
@@ -705,10 +707,13 @@ export type SettingsSection = typeof SETTINGS_SECTIONS[number]["id"]
 const SECTIONS_KEY = SETTINGS_SECTIONS.map((item) => item.id).join(",")
 
 export function SettingsView({
+  panelActive = true,
   section,
   openAddRequest = 0,
   navigationRequest = 0,
 }: {
+  /** 主面板可见；隐藏时指标预览暂停全部轮询与订阅 */
+  panelActive?: boolean
   section: SettingsSection
   /** 由所选连接驱动，与总览的当前查看平台相互独立 */
   islandPlatform: PlatformId
@@ -847,6 +852,7 @@ export function SettingsView({
         cfg={cfg}
         connectionPlatform={connectionPlatform}
         onConnectionPlatformChange={setConnectionPlatform}
+        panelActive={panelActive}
       />
       </fieldset>
 

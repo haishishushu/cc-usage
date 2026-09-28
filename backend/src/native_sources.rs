@@ -1,6 +1,7 @@
 //! 经核实的本机来源：只读第三方文件，记录写入本应用数据库。
 use crate::{
     collector::ScanResult,
+    db::Store,
     native_parse as parse,
     source_store::{self, Record},
 };
@@ -271,12 +272,40 @@ fn stamp(path: &Path) -> Result<(i64, i64), String> {
         .unwrap_or(0);
     Ok((m.len() as i64, time))
 }
+/// 戳记里的 `parser_initialized=1` 表示 offset 落在完整行边界上，可以据此续读；
+/// 旧版本按整份文件大小记录的戳记没有这个标记，首次升级时整份重读一次。
 fn save_stamp(conn: &Connection, key: &str, size: i64, time: i64) -> rusqlite::Result<usize> {
-    conn.execute("INSERT INTO scan_state(path,offset,mtime) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET offset=?2,mtime=?3",params![key,size,time])
+    conn.prepare_cached("INSERT INTO scan_state(path,offset,mtime,parser_initialized) VALUES(?1,?2,?3,1)
+        ON CONFLICT(path) DO UPDATE SET offset=?2,mtime=?3,parser_initialized=1")?.execute(params![key,size,time])
+}
+
+/// 第三方 SQLite（Zcode 用量库、Qoder / WorkBuddy 会话库）的内容戳记：主库与 WAL 任一变化即视为有新数据。
+fn db_stamps(path: &Path) -> Result<[(i64, i64); 2], String> {
+    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    Ok([stamp(path)?, if wal.exists() { stamp(&wal)? } else { (0, 0) }])
+}
+
+fn db_unchanged(conn: &Connection, key: &str, stamps: [(i64, i64); 2]) -> bool {
+    crate::db::get_scan_state(conn, key) == Some(stamps[0])
+        && crate::db::get_scan_state(conn, &format!("{key}-wal")) == Some(stamps[1])
+}
+
+fn save_db_stamps(conn: &Connection, key: &str, stamps: [(i64, i64); 2]) -> rusqlite::Result<()> {
+    save_stamp(conn, key, stamps[0].0, stamps[0].1)?;
+    save_stamp(conn, &format!("{key}-wal"), stamps[1].0, stamps[1].1)?;
+    Ok(())
 }
 
 fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
-    if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 {
+    json_lines_from(path, 0).map(|(lines, _)| lines)
+}
+
+/// 从 `start` 起读取完整的 JSONL 行，返回解析结果与读到的行边界位置；
+/// 没有换行的尾行仍在写入，留给下次。`.json` 快照总是整份读取。
+fn json_lines_from(path: &Path, start: i64) -> Result<(Vec<Value>, i64), String> {
+    use std::io::{Seek, SeekFrom};
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size.saturating_sub(start.max(0) as u64) > 64 * 1024 * 1024 {
         return Err("会话文件超过 64 MiB 读取上限".into());
     }
     if path.extension().is_some_and(|s| s == "json") {
@@ -284,12 +313,15 @@ fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
             return Err("会话快照超过 64 MiB 读取上限".into());
         }
         return serde_json::from_reader(std::fs::File::open(path).map_err(|e| e.to_string())?)
-            .map(|v| vec![v])
+            .map(|v| (vec![v], size as i64))
             .map_err(|_| "会话 JSON 格式无效".into());
     }
-    let mut reader = BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(start.max(0) as u64)).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
     let mut out = Vec::new();
     let mut bytes = Vec::new();
+    let mut consumed = start.max(0);
     loop {
         bytes.clear();
         let read = reader
@@ -301,6 +333,7 @@ fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
         if bytes.last() != Some(&b'\n') {
             break;
         } // 尚在追加的尾行留给下次
+        consumed += read as i64;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -309,7 +342,24 @@ fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
                 .map_err(|_| "会话含无效 JSON 行，未推进读取位点".to_string())?,
         );
     }
-    Ok(out)
+    Ok((out, consumed))
+}
+
+/// Qoder / WorkBuddy 的会话日志只追加：已处理到的行边界之后才有新记录。
+/// 位点缺失、来自旧版本、文件被截断或等长重写、或位点不在行边界上时从头读。
+fn resume_offset(path: &Path, saved: Option<&crate::db::ScanCheckpoint>, size: i64, time: i64) -> i64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(saved) = saved.filter(|saved| saved.parser_initialized) else { return 0 };
+    if saved.offset <= 0 || saved.offset > size || (saved.offset == size && saved.mtime != time) {
+        return 0;
+    }
+    let boundary = std::fs::File::open(path).ok().and_then(|mut file| {
+        file.seek(SeekFrom::Start(saved.offset as u64 - 1)).ok()?;
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).ok()?;
+        Some(byte[0] == b'\n')
+    });
+    if boundary == Some(true) { saved.offset } else { 0 }
 }
 
 fn qoder_availability(app: &Path, source: &str) -> HashMap<String, (bool, i64)> {
@@ -344,18 +394,15 @@ fn qoder_availability(app: &Path, source: &str) -> HashMap<String, (bool, i64)> 
 }
 
 fn scan_files(
-    conn: &mut Connection,
+    db: &mut impl Store,
     source: &Source,
     app: &Path,
 ) -> Result<(usize, Vec<String>), String> {
     let mut paths = Vec::new();
     files(&source.path, &mut paths)?;
     paths.sort();
-    let availability = if source.platform == "qoder" {
-        qoder_availability(app, &source.id)
-    } else {
-        HashMap::new()
-    };
+    // Qoder 上下文快照只用于解释新记录：没有文件需要解析时不去读它的会话库。
+    let mut availability: Option<HashMap<String, (bool, i64)>> = None;
     let mut changed = 0;
     let mut errors = Vec::new();
     for path in paths {
@@ -378,17 +425,34 @@ fn scan_files(
             }
             let (size, time) = stamp(&path)?;
             let key = path.to_string_lossy().to_string();
-            if crate::db::get_scan_state(conn, &key) == Some((size, time)) {
-                return Ok(0);
-            }
-            let lines = json_lines(&path)?;
+            let saved = db.write(|conn| crate::db::get_scan_checkpoint(conn, &key));
+            // Gemini 是整份留存快照（rewind 会删消息），只能整份重建；其余来源按行追加续读。
+            let snapshot = source.platform == "gemini";
+            let start = if snapshot {
+                if saved.as_ref().is_some_and(|saved| (saved.offset, saved.mtime) == (size, time)) {
+                    return Ok(0);
+                }
+                0
+            } else {
+                let start = resume_offset(&path, saved.as_ref(), size, time);
+                if start == size && saved.as_ref().is_some_and(|saved| saved.mtime == time) {
+                    return Ok(0);
+                }
+                start
+            };
+            let (lines, consumed) = json_lines_from(&path, start)?;
             let fallback = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            let records = if source.platform == "gemini" {
+            let records = if snapshot {
                 parse::gemini_records(&lines, &source.id)
             } else {
+                if source.platform == "qoder" && availability.is_none() && !lines.is_empty() {
+                    availability = Some(qoder_availability(app, &source.id));
+                }
+                let empty = HashMap::new();
+                let availability = availability.as_ref().unwrap_or(&empty);
                 let mut latest = HashMap::new();
                 for line in &lines {
                     let r = if source.platform == "workbuddy" {
@@ -408,55 +472,59 @@ fn scan_files(
                 }
                 latest.into_values().collect()
             };
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
-            let mut file_changed = source_store::write(&tx, &records).map_err(|e| e.to_string())?;
-            for r in &records {
-                if let Some(id) = &r.request.session_id {
-                    crate::db::set_session_activity(
-                        &tx,
-                        &source.platform,
-                        id,
-                        "unknown",
-                        r.request.ts,
-                    )
-                    .map_err(|e| e.to_string())?;
+            db.write(|conn| -> Result<usize, String> {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                let mut file_changed = source_store::write(&tx, &records).map_err(|e| e.to_string())?;
+                for r in &records {
+                    if let Some(id) = &r.request.session_id {
+                        crate::db::set_session_activity(
+                            &tx,
+                            &source.platform,
+                            id,
+                            "unknown",
+                            r.request.ts,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                 }
-            }
-            if source.platform == "gemini" {
-                // 原文件是留存快照；官方 rewind 后移除的消息也从该快照统计中移除。
-                if let Some(sid) = lines.iter().rev().find_map(|v| {
-                    parse::text(v, "sessionId")
-                        .or_else(|| v.get("$set").and_then(|v| parse::text(v, "sessionId")))
-                }) {
-                    let id = format!("{}:{sid}", source.id);
-                    let keys: HashSet<_> = records
-                        .iter()
-                        .map(|r| r.request.dedup_key.as_str())
-                        .collect();
-                    let old: Vec<(i64, String)> = {
-                        let mut q=tx.prepare("SELECT id,dedup_key FROM requests WHERE source=?1 AND session_id=?2").map_err(|e|e.to_string())?;
-                        let rows = q
-                            .query_map(params![source.id, id], |r| Ok((r.get(0)?, r.get(1)?)))
-                            .map_err(|e| e.to_string())?;
-                        rows.collect::<rusqlite::Result<_>>()
-                            .map_err(|e| e.to_string())?
-                    };
-                    for (id, key) in old {
-                        if !keys.contains(key.as_str()) {
-                            tx.execute("DELETE FROM request_metrics WHERE request_id=?1", [id])
+                if snapshot {
+                    // 原文件是留存快照；官方 rewind 后移除的消息也从该快照统计中移除。
+                    if let Some(sid) = lines.iter().rev().find_map(|v| {
+                        parse::text(v, "sessionId")
+                            .or_else(|| v.get("$set").and_then(|v| parse::text(v, "sessionId")))
+                    }) {
+                        let id = format!("{}:{sid}", source.id);
+                        let keys: HashSet<_> = records
+                            .iter()
+                            .map(|r| r.request.dedup_key.as_str())
+                            .collect();
+                        let old: Vec<(i64, String)> = {
+                            let mut q=tx.prepare("SELECT id,dedup_key FROM requests WHERE source=?1 AND session_id=?2").map_err(|e|e.to_string())?;
+                            let rows = q
+                                .query_map(params![source.id, id], |r| Ok((r.get(0)?, r.get(1)?)))
                                 .map_err(|e| e.to_string())?;
-                            tx.execute("DELETE FROM usage_events WHERE request_id=?1", [id])
-                                .map_err(|e| e.to_string())?;
-                            file_changed += tx
-                                .execute("DELETE FROM requests WHERE id=?1", [id])
-                                .map_err(|e| e.to_string())?;
+                            rows.collect::<rusqlite::Result<_>>()
+                                .map_err(|e| e.to_string())?
+                        };
+                        for (id, key) in old {
+                            if !keys.contains(key.as_str()) {
+                                tx.execute("DELETE FROM request_metrics WHERE request_id=?1", [id])
+                                    .map_err(|e| e.to_string())?;
+                                tx.execute("DELETE FROM usage_events WHERE request_id=?1", [id])
+                                    .map_err(|e| e.to_string())?;
+                                file_changed += tx
+                                    .execute("DELETE FROM requests WHERE id=?1", [id])
+                                    .map_err(|e| e.to_string())?;
+                            }
                         }
                     }
                 }
-            }
-            save_stamp(&tx, &key, size, time).map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
-            Ok(file_changed)
+                // 快照记整份大小；追加日志只记到最后一个完整行，尾部半行下次接着读。
+                let offset = if snapshot { size } else { consumed };
+                save_stamp(&tx, &key, offset, time).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                Ok(file_changed)
+            })
         })();
         match result {
             Ok(n) => changed += n,
@@ -469,16 +537,13 @@ fn scan_files(
     Ok((changed, errors))
 }
 
-fn zcode(conn: &mut Connection, source: &Source) -> Result<usize, String> {
+fn zcode(db: &mut impl Store, source: &Source) -> Result<usize, String> {
     let key = source.path.to_string_lossy().to_string();
-    let wal = PathBuf::from(format!("{key}-wal"));
-    let db_stamp = stamp(&source.path)?;
-    let wal_stamp = if wal.exists() { stamp(&wal)? } else { (0, 0) };
-    if crate::db::get_scan_state(conn, &key) == Some(db_stamp)
-        && crate::db::get_scan_state(conn, &format!("{key}-wal")) == Some(wal_stamp)
-    {
+    let stamps = db_stamps(&source.path)?;
+    if db.write(|conn| db_unchanged(conn, &key, stamps)) {
         return Ok(0);
     }
+    // 读取第三方库不占本应用写锁。
     let input = readonly(&source.path)?;
     let mut stmt = input
         .prepare(
@@ -560,50 +625,71 @@ fn zcode(conn: &mut Connection, source: &Source) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut changed = 0;
-    for (r, status, title) in rows {
-        changed += source_store::write(&tx, &[r.clone()]).map_err(|e| e.to_string())?;
-        tx.execute("UPDATE requests SET native_outcome=?1 WHERE source=?2 AND dedup_key=?3 AND native_outcome IS NOT ?1",
-            params![match status.as_str() {"completed"=>"success","error"|"cancelled"=>"failed",_=>"unknown"},source.id,r.request.dedup_key]).map_err(|e|e.to_string())?;
-        if let Some(id) = &r.request.session_id {
-            if let Some(title) = title {
-                crate::db::upsert_session_title(&tx, "zcode", id, &title)
-                    .map_err(|e| e.to_string())?;
-            }
-            let state = match status.as_str() {
-                "completed" => "done",
-                "error" | "cancelled" => "failed",
-                _ => "unknown",
-            };
-            crate::db::set_session_activity(&tx, "zcode", id, state, r.request.ts)
-                .map_err(|e| e.to_string())?;
+    drop(stmt);
+    drop(input);
+    // 同一会话只需按最新一条写活动状态与标题（活动更新本身按时间只进不退）。
+    let mut sessions: HashMap<String, (&'static str, i64, Option<String>)> = HashMap::new();
+    for (r, status, title) in &rows {
+        let Some(id) = &r.request.session_id else { continue };
+        let state = match status.as_str() {
+            "completed" => "done",
+            "error" | "cancelled" => "failed",
+            _ => "unknown",
+        };
+        let entry = sessions.entry(id.clone()).or_insert((state, r.request.ts, None));
+        if r.request.ts >= entry.1 {
+            entry.0 = state;
+            entry.1 = r.request.ts;
+        }
+        if entry.2.is_none() {
+            entry.2 = title.clone();
         }
     }
-    save_stamp(&tx, &key, db_stamp.0, db_stamp.1).map_err(|e| e.to_string())?;
-    save_stamp(&tx, &format!("{key}-wal"), wal_stamp.0, wal_stamp.1).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(changed)
+    db.write(|conn| -> Result<usize, String> {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let records: Vec<Record> = rows.iter().map(|(r, _, _)| r.clone()).collect();
+        let changed = source_store::write(&tx, &records).map_err(|e| e.to_string())?;
+        let mut outcome = tx.prepare_cached("UPDATE requests SET native_outcome=?1 WHERE source=?2 AND dedup_key=?3 AND native_outcome IS NOT ?1")
+            .map_err(|e| e.to_string())?;
+        for (r, status, _) in &rows {
+            outcome.execute(params![match status.as_str() {"completed"=>"success","error"|"cancelled"=>"failed",_=>"unknown"},source.id,r.request.dedup_key])
+                .map_err(|e| e.to_string())?;
+        }
+        drop(outcome);
+        for (id, (state, ts, title)) in &sessions {
+            if let Some(title) = title {
+                crate::db::upsert_session_title(&tx, "zcode", id, title).map_err(|e| e.to_string())?;
+            }
+            crate::db::set_session_activity(&tx, "zcode", id, state, *ts).map_err(|e| e.to_string())?;
+        }
+        save_db_stamps(&tx, &key, stamps).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    })
 }
 
-fn session_metadata(conn: &mut Connection, source: &Source, app: &Path) -> Result<usize, String> {
-    let path = if source.platform == "workbuddy" {
-        source
-            .path
-            .parent()
-            .unwrap_or(&source.path)
-            .join("workbuddy.db")
-    } else if source.platform == "qoder" {
-        app.join(if source.id.ends_with(":cn") {
+/// 会话库路径：WorkBuddy 在项目目录旁的 workbuddy.db，Qoder 在应用数据目录的 main.sqlite。
+fn metadata_db(source: &Source, app: &Path) -> Option<PathBuf> {
+    match source.platform.as_str() {
+        "workbuddy" => Some(source.path.parent().unwrap_or(&source.path).join("workbuddy.db")),
+        "qoder" => Some(app.join(if source.id.ends_with(":cn") {
             "com.qodercn.app.stable"
         } else {
             "com.qoder.app.stable"
-        })
-        .join("main.sqlite")
-    } else {
-        return Ok(0);
-    };
+        }).join("main.sqlite")),
+        _ => None,
+    }
+}
+
+fn session_metadata(db: &mut impl Store, source: &Source, app: &Path) -> Result<usize, String> {
+    let Some(path) = metadata_db(source, app) else { return Ok(0) };
     if !path.exists() {
+        return Ok(0);
+    }
+    // 会话库没变就不重读、不逐条 upsert；戳记键加前缀，避免与日志文件位点混用。
+    let key = format!("meta:{}", path.to_string_lossy());
+    let stamps = db_stamps(&path)?;
+    if db.write(|conn| db_unchanged(conn, &key, stamps)) {
         return Ok(0);
     }
     let input = readonly(&path)?;
@@ -630,63 +716,97 @@ fn session_metadata(conn: &mut Connection, source: &Source, app: &Path) -> Resul
         .map_err(|e| e.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut changed = 0;
-    for (id, title, model, used, size, ts, snapshot) in rows {
-        let session = format!("{}:{id}", source.id);
-        if let Some(title) = title.filter(|s| !s.trim().is_empty()) {
-            crate::db::upsert_session_title(&tx, &source.platform, &session, &title)
+    drop(q);
+    drop(input);
+    db.write(|conn| -> Result<usize, String> {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        for (id, title, model, used, size, ts, snapshot) in rows {
+            let session = format!("{}:{id}", source.id);
+            if let Some(title) = title.filter(|s| !s.trim().is_empty()) {
+                crate::db::upsert_session_title(&tx, &source.platform, &session, &title)
+                    .map_err(|e| e.to_string())?;
+            }
+            let ratio = used
+                .zip(size)
+                .filter(|(u, s)| *u >= 0 && *s > 0 && *u <= *s)
+                .map(|(u, s)| u as f64 / s as f64)
+                .or_else(|| {
+                    snapshot
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                        .and_then(|v| parse::amount(&v, "percentage"))
+                });
+            if let Some((ratio, ts)) = ratio.zip(ts) {
+                changed += source_store::context(
+                    &tx,
+                    &source_store::ContextSnapshot {
+                        platform: source.platform.clone(),
+                        source: source.id.clone(),
+                        session_id: session,
+                        model,
+                        ratio,
+                        ts,
+                    },
+                )
                 .map_err(|e| e.to_string())?;
+            }
         }
-        let ratio = used
-            .zip(size)
-            .filter(|(u, s)| *u >= 0 && *s > 0 && *u <= *s)
-            .map(|(u, s)| u as f64 / s as f64)
-            .or_else(|| {
-                snapshot
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| parse::amount(&v, "percentage"))
-            });
-        if let Some((ratio, ts)) = ratio.zip(ts) {
-            changed += source_store::context(
-                &tx,
-                &source_store::ContextSnapshot {
-                    platform: source.platform.clone(),
-                    source: source.id.clone(),
-                    session_id: session,
-                    model,
-                    ratio,
-                    ts,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(changed)
+        save_db_stamps(&tx, &key, stamps).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    })
 }
 
-pub fn scan_at(conn: &mut Connection, home: &Path, app: &Path) -> ScanResult {
+/// 来源的监听根目录：目录型来源就是目录本身，Zcode 这类单文件库取所在目录（WAL 也在里面）。
+fn watch_root(source: &Source) -> PathBuf {
+    if source.path.extension().is_some() && !source.path.is_dir() {
+        source.path.parent().unwrap_or(&source.path).to_path_buf()
+    } else {
+        source.path.clone()
+    }
+}
+
+/// 需要实时监听的本机来源根目录（含尚不存在的，监听器按存在与否自行绑定）。
+pub fn watch_roots() -> Vec<PathBuf> {
+    let Some(home) = home() else { return Vec::new() };
+    sources_at(&home, &app_data())
+        .into_iter()
+        .filter(|source| crate::platforms::supports(&source.platform, "local_sessions"))
+        .map(|source| watch_root(&source))
+        .collect()
+}
+
+pub fn scan_at(db: &mut impl Store, home: &Path, app: &Path) -> ScanResult {
+    scan_sources(db, home, app, None)
+}
+
+fn scan_sources(db: &mut impl Store, home: &Path, app: &Path, only: Option<&[PathBuf]>) -> ScanResult {
     let mut result = ScanResult::default();
     for source in sources_at(home, app) {
         if !source.available || !crate::platforms::supports(&source.platform, "local_sessions") {
             continue;
         }
+        if let Some(changed) = only {
+            let root = watch_root(&source);
+            if !changed.iter().any(|path| path.starts_with(&root)) {
+                continue;
+            }
+        }
         // 显式暂停的本机连接停止该来源采集；尚未添加连接时保持本地统计自动发现。
-        let paused: bool = conn
+        let paused: bool = db.write(|conn| conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM connections WHERE id=?1 AND status='paused')",
                 [format!("monitor:{}", source.id)],
                 |r| r.get(0),
             )
-            .unwrap_or(false);
+            .unwrap_or(false));
         if paused {
             continue;
         }
         let read = if source.platform == "zcode" {
-            zcode(conn, &source).map(|n| (n, Vec::new()))
+            zcode(db, &source).map(|n| (n, Vec::new()))
         } else {
-            scan_files(conn, &source, app)
+            scan_files(db, &source, app)
         };
         result.files_scanned += 1;
         match read {
@@ -704,7 +824,7 @@ pub fn scan_at(conn: &mut Connection, home: &Path, app: &Path) -> ScanResult {
                 result.errors.push(format!("{}：{reason}", source.name));
             }
         }
-        match session_metadata(conn, &source, app) {
+        match session_metadata(db, &source, app) {
             Ok(n) => result.records_inserted += n,
             Err(reason) => {
                 result.failed_sources.push(source.platform.clone());
@@ -716,9 +836,16 @@ pub fn scan_at(conn: &mut Connection, home: &Path, app: &Path) -> ScanResult {
     }
     result
 }
-pub fn scan(conn: &mut Connection) -> ScanResult {
+pub fn scan(db: &mut impl Store) -> ScanResult {
     home()
-        .map(|h| scan_at(conn, &h, &app_data()))
+        .map(|h| scan_at(db, &h, &app_data()))
+        .unwrap_or_default()
+}
+
+/// 写事件只落在某些来源目录时，只扫这些来源。
+pub fn scan_changed(db: &mut impl Store, changed: &[PathBuf]) -> ScanResult {
+    home()
+        .map(|h| scan_sources(db, &h, &app_data(), Some(changed)))
         .unwrap_or_default()
 }
 
@@ -821,6 +948,65 @@ mod tests {
                 .unwrap(),
             0
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn appended_session_lines_are_read_incrementally_and_legacy_stamps_rebuild_once() {
+        use std::io::Write;
+        let root = fixture_dir("incremental");
+        // 与目录枚举得到的路径字符串一致（位点以路径字符串为键）
+        let folder = root.join(".workbuddy/projects").join("p");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("s.jsonl");
+        let line = |id: &str| serde_json::json!({"id":id,"sessionId":"s","timestamp":1000,"providerData":{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15},"rawUsage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":0},"credit":0.5}}}).to_string();
+        let count = |conn: &Connection| conn.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0)).unwrap();
+        let key = path.to_string_lossy().to_string();
+        std::fs::write(&path, format!("{}\n", line("a"))).unwrap();
+        let mut conn = crate::db::open(Path::new(":memory:")).unwrap();
+        assert_eq!(scan_at(&mut conn, &root, &root).records_inserted, 1);
+
+        // 追加一整行和半行：只读新增的完整行，位点停在行边界，半行留给下次。
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}\n{}", line("b"), &line("c")[..20]).unwrap();
+        drop(file);
+        let result = scan_at(&mut conn, &root, &root);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.records_inserted, 1);
+        assert_eq!(count(&conn), 2);
+        let boundary = format!("{}\n{}\n", line("a"), line("b")).len() as i64;
+        assert_eq!(crate::db::get_scan_checkpoint(&conn, &key).unwrap().offset, boundary);
+
+        // 半行写完后接着读，不重复计入前两行。
+        std::fs::write(&path, format!("{}\n{}\n{}\n", line("a"), line("b"), line("c"))).unwrap();
+        assert_eq!(scan_at(&mut conn, &root, &root).records_inserted, 1);
+        assert_eq!(count(&conn), 3);
+
+        // 旧版本的整份戳记（无行边界标记）与落在行中间的位点都从头重读一次，结果不变。
+        for (offset, initialized) in [(std::fs::metadata(&path).unwrap().len() as i64, 0), (boundary - 3, 1)] {
+            conn.execute("UPDATE scan_state SET offset=?1, mtime=0, parser_initialized=?2 WHERE path=?3", params![offset, initialized, key]).unwrap();
+            let result = scan_at(&mut conn, &root, &root);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.records_inserted, 0);
+            assert_eq!(count(&conn), 3);
+            let checkpoint = crate::db::get_scan_checkpoint(&conn, &key).unwrap();
+            assert!(checkpoint.parser_initialized);
+            assert_eq!(checkpoint.offset, std::fs::metadata(&path).unwrap().len() as i64);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn changed_paths_only_scan_the_sources_that_contain_them() {
+        let root = fixture_dir("targeted");
+        let folder = root.join(".workbuddy/projects/p");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("s.jsonl");
+        std::fs::write(&path, format!("{}\n", serde_json::json!({"id":"m","sessionId":"s","timestamp":1000,"providerData":{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15},"rawUsage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}}))).unwrap();
+        let mut conn = crate::db::open(Path::new(":memory:")).unwrap();
+        let elsewhere = [root.join(".claude/projects/x/y.jsonl")];
+        let skipped = scan_sources(&mut conn, &root, &root, Some(&elsewhere));
+        assert_eq!((skipped.files_scanned, skipped.records_inserted), (0, 0));
+        let hit = scan_sources(&mut conn, &root, &root, Some(std::slice::from_ref(&path)));
+        assert_eq!((hit.files_scanned, hit.records_inserted), (1, 1));
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]

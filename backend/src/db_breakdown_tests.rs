@@ -241,3 +241,42 @@ fn degenerate_zero_row_is_excluded_from_stats_but_kept_in_log() {
     assert_eq!(log.total_count, 2, "请求日志保留全部记录，含退化行");
     assert!(log.rows.iter().any(|row| row.total.is_none()), "退化行在日志中总量显示「—」");
 }
+
+/// 四个周期合并成一次扫描后，必须与逐周期单独求和完全一致：
+/// 跨越今日 / 本周 / 本月 / 更早的记录、未知总量、退化空响应、模型筛选与未来时间都覆盖到。
+#[test]
+fn merged_period_totals_match_per_period_queries() {
+    let now = Local::now().timestamp_millis();
+    let day = 86_400_000;
+    let conn = seeded(&[
+        rec("claude", "today", now - 1_000, Some("m1"), Some(10), Some(5), Some(0), Some(0), Some(15)),
+        rec("claude", "yesterday", now - day, Some("m2"), Some(20), Some(5), Some(0), Some(0), Some(25)),
+        rec("claude", "last-week", now - 8 * day, Some("m1"), Some(30), Some(5), Some(0), Some(0), Some(35)),
+        rec("claude", "old-unknown", now - 40 * day, Some("m1"), Some(1), Some(1), None, None, None),
+        rec("claude", "degenerate", now - 2_000, Some("m1"), Some(0), Some(0), None, Some(0), Some(0)),
+        rec("claude", "future", now + day, Some("m1"), Some(99), Some(1), Some(0), Some(0), Some(100)),
+        rec("codex", "other-platform", now - 1_000, Some("m1"), Some(7), Some(3), Some(0), Some(0), Some(10)),
+    ]);
+    let per_period = |platform: &str, model: Option<&str>| -> [Option<i64>; 4] {
+        let filter = Filter::new(platform, model, 3);
+        let empty = if crate::platforms::native(platform) { "NULL" } else { "0" };
+        let sql = format!(
+            "SELECT CASE WHEN COUNT(*) = 0 THEN {empty} WHEN MIN(total_known) = 1 THEN SUM(total_tokens) ELSE NULL END
+             FROM requests WHERE ts >= ?1 AND ts < ?2{EXCLUDE_DEGENERATE_SQL}{}",
+            filter.clause
+        );
+        ["today", "week", "month", "total"].map(|period| {
+            let (start, end) = period_range_at(&conn, platform, period, now);
+            conn.query_row(&sql, rusqlite::params_from_iter(filter.params(&[start, end])), |r| r.get(0)).unwrap()
+        })
+    };
+    for (platform, model) in [("claude", None), ("claude", Some("m1")), ("claude", Some("m2")),
+        ("codex", None), ("all", None), ("gemini", None), ("claude", Some("missing"))] {
+        let merged = token_totals_at(&conn, platform, None, model, now).unwrap();
+        assert_eq!(
+            [merged.today, merged.week, merged.month, merged.total],
+            per_period(platform, model),
+            "{platform} / {model:?}"
+        );
+    }
+}
