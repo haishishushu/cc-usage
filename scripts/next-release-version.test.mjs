@@ -20,3 +20,10 @@ test("补丁号 99 后到 100，100 后进位到下一次要版本", () => {
 test("首次持续构建从配置版本递增，忽略无关资源", () => {
   assert.equal(nextReleaseVersion("0.1.0", [{ name: "latest.json" }, { name: "CC-Usage-vx.y.z-debug.txt" }]), "0.1.1")
 })
+
+test("独立发行标签与旧 continuous 资源共同决定下一版", () => {
+  const legacyAssets = [{ name: "CC-Usage-v0.1.13-Windows-x86_64-Setup.exe" }]
+  assert.equal(nextReleaseVersion("0.1.0", legacyAssets, ["v0.1.0"]), "0.1.14")
+  assert.equal(nextReleaseVersion("0.1.0", legacyAssets, ["v0.1.14", "v0.1.3"]), "0.1.15")
+  assert.equal(nextReleaseVersion("0.1.0", [], ["v0.1.100", "continuous", "vbroken"]), "0.2.0")
+})

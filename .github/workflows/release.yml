@@ -10,14 +10,15 @@ on:
 
 concurrency:
   group: desktop-release-${{ github.ref }}
-  cancel-in-progress: true
+  # 每次 main 提交都产生独立版本；不中途取消已开始的发行。
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
   prepare-continuous-release:
-    name: 更新持续构建标签
+    name: 计算独立发行版本
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
@@ -28,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 计算下一个持续构建版本号
+      - name: 计算下一个独立发行版本号
         id: next-version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,15 +39,10 @@ jobs:
           gh release view continuous \
             --repo "$GITHUB_REPOSITORY" \
             --json assets > "$RUNNER_TEMP/continuous-release.json"
-          VERSION=$(node scripts/next-release-version.mjs "$RUNNER_TEMP/continuous-release.json")
+          git tag --list 'v*' > "$RUNNER_TEMP/version-tags.txt"
+          VERSION=$(node scripts/next-release-version.mjs "$RUNNER_TEMP/continuous-release.json" "$RUNNER_TEMP/version-tags.txt")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "下一个持续构建版本号：$VERSION"
-
-      - name: 将 continuous 标签指向本次提交
-        shell: bash
-        run: |
-          git tag --force continuous "${GITHUB_SHA}"
-          git push --force origin refs/tags/continuous
+          echo "下一个独立发行版本号：$VERSION（标签 v$VERSION）"
 
   publish:
     needs: prepare-continuous-release
@@ -128,9 +124,9 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --dir frontend install --frozen-lockfile
 
-      # 主分支使用 prepare job 从已有安装包推算的统一版本号；
+      # 主分支使用 prepare job 从旧资源与独立标签推算的统一版本号；
       # 打 tag 的正式版仍使用 tauri.conf.json 中的版本号。
-      - name: 生成持续构建版本号
+      - name: 生成本次发行版本号
         if: github.ref_type != 'tag'
         env:
           CONTINUOUS_VERSION: ${{ needs.prepare-continuous-release.outputs.version }}
@@ -142,14 +138,26 @@ jobs:
             const path = "backend/tauri.conf.json";
             const conf = JSON.parse(fs.readFileSync(path, "utf8"));
             const version = process.env.CONTINUOUS_VERSION;
-            if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("持续构建版本号缺失或无效");
+            if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("发行版本号缺失或无效");
             conf.version = version;
             fs.writeFileSync(path, `${JSON.stringify(conf, null, 2)}\n`);
             // Cargo.toml 与 conf 保持一致，避免两处版本号各说各话
             const cargo = "backend/Cargo.toml";
             const text = fs.readFileSync(cargo, "utf8");
             fs.writeFileSync(cargo, text.replace(/^version = ".*"$/m, `version = "${version}"`));
-            console.log(`持续构建版本号：${version}`);
+            console.log(`发行版本号：${version}`);
+          '
+
+      - name: 校验正式标签与应用版本一致
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const version = JSON.parse(fs.readFileSync("backend/tauri.conf.json", "utf8")).version;
+            if (process.env.TAG !== `v${version}`) throw new Error(`标签 ${process.env.TAG} 与应用版本 ${version} 不一致`);
           '
 
       - name: 构建并发布安装包
@@ -158,31 +166,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && 'v__VERSION__' || 'continuous' }}
+          tagName: v__VERSION__
           releaseName: CC Usage v__VERSION__
           releaseBody: |
             请在下方选择适合当前系统的安装包。
 
-            `continuous` 为 main 分支每次提交后自动更新的持续构建版；`v*` 标签为正式稳定版。
+            本发行版只包含 v__VERSION__ 的安装包。请选择与操作系统和处理器架构相符的文件。
           releaseDraft: false
-          # 持续构建版也标为正式发布：GitHub 的「最新发行版」徽章只认非预发布，
-          # 标成预发布的话徽章会一直留在旧的 v* 标签上误导访客，
-          # 而且回退端点 releases/latest 会跟着指向旧版本，向用户谎报「已是最新」。
           prerelease: false
           assetNamePattern: ${{ matrix.assetNamePattern }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
   publish-manifest:
-    needs: publish
+    needs: [prepare-continuous-release, publish]
     name: 发布更新清单到 Pages
     runs-on: ubuntu-latest
     # 全平台构建完 latest.json 才是完整的；任一平台失败就不发布，
     # 避免把缺平台的清单推上去让那些用户收到半截更新。
-    if: success()
+    if: always() && needs.publish.result == 'success'
     # 用 Pages 的 Actions 部署模式：不建分支、不往仓库提交任何东西，
     # 与 cc-usage-website 仓库同一套模式。
     permissions:
-      # contents 需要写权限：下面要把发行版的标题与预发布标记同步成当前版本
+      # contents 需要写权限：下面要验证发行版并标记最新版本
       contents: write
       pages: write
       id-token: write
@@ -190,10 +195,13 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      - name: 检出校验脚本
+        uses: actions/checkout@v4
+
       - name: 取回本次发布的 latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'continuous' }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.prepare-continuous-release.outputs.version) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -205,14 +213,30 @@ jobs:
           echo "发布的清单版本：$(node -p "require('./site/latest.json').version")"
           echo "覆盖平台：$(node -p "Object.keys(require('./site/latest.json').platforms).join(', ')")"
 
-      # tauri-action 只在「创建」发行版时写标题与预发布标记，复用同一个
-      # continuous 标签时不会更新它们，所以这里每次构建后显式同步一次：
-      # 标题带上真实版本号，并标成正式发布，让「最新发行版」徽章与
-      # releases/latest 回退端点都指向本次构建。
-      - name: 同步发行版元数据
+      - name: 校验安装包与更新清单的版本
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'continuous' }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.prepare-continuous-release.outputs.version) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/release.json"
+          VERSION=$(node -p "require('./site/latest.json').version")
+          node scripts/verify-release.mjs "$VERSION" "$TAG" site/latest.json "$RUNNER_TEMP/release.json"
+
+      - name: 上传 Pages 制品
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: 部署到 Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: 标记本版为最新发行版
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.prepare-continuous-release.outputs.version) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -223,12 +247,3 @@ jobs:
             --prerelease=false \
             --latest
           echo "已将 $TAG 标记为最新发行版：CC Usage v${VERSION}"
-
-      - name: 上传 Pages 制品
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-      - name: 部署到 Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
