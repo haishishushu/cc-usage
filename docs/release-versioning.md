@@ -9,19 +9,21 @@
 ## 每版单独发行
 
 - `main` 的每次成功构建使用一个新的 `vX.Y.Z` 标签和同名 GitHub Release。发行版只上传该版本的安装包、签名与 `latest.json`，不再向 `continuous` 追加资源或强制移动标签。
-- 版本号取 `backend/tauri.conf.json`、已有 `vX.Y.Z` 标签以及旧 `continuous` 资源文件名中的最高版本，再按上述规则递增。旧资源仅用于迁移期间防止重复取号。
+- 版本号取 `backend/tauri.conf.json` 与已有 `vX.Y.Z` 标签中的最高版本，再按上述规则递增。历史版本已迁移完毕，版本计算不再依赖 `continuous`。
 - 同一工作流的 Windows、macOS 和 Linux 安装包共用版本号。发布更新清单前会检查标签、清单、安装包名称和下载地址都属于这一版；任一平台缺包则不部署新清单。
 - 构建失败后已创建的标签或部分发行版不复用版本号。下一次构建取更高版本，避免旧包与新包混在一页。
 - 应用更新清单指向 `releases/download/vX.Y.Z/…`；官网显示某个版本时，对应的发行页使用 `releases/tag/vX.Y.Z`。点击该页只能看到该版本的安装包。
 
-维护者手动推送 `v*` 标签时，标签必须与 `backend/tauri.conf.json` 的版本一致。发行标签不应强制改指向或复用到别的提交。`continuous` 是旧流程的历史标签，不再接收新版本；旧资源完成分版迁移并确认新版更新清单生效后，才可将旧发行版转为草稿归档。
+维护者手动推送 `v*` 标签时，标签必须与 `backend/tauri.conf.json` 的版本一致。发行标签不应强制改指向或复用到别的提交。只改迁移工具或文档、无需重打安装包的维护提交可以使用 GitHub Actions 的 `[skip ci]` 跳过发行。
 
 ## 旧发行版迁移
 
-旧 `continuous` 目前保存了 `v0.1.9` 至 `v0.1.13` 的完整安装包。先让新工作流成功发布独立的更新版本，并确认 Pages 的 `latest.json` 已指向该版本；再运行只读预览，核对每版的 8 个文件和原构建提交：
+旧 `continuous` 中的完整安装包已迁移至 `v0.1.9` 至 `v0.1.13` 五个独立发行页，每版 8 个文件。新工作流发布了 `v0.1.14`，Pages 的 `latest.json` 指向该标签后，`continuous` 已转为草稿，仍保存原资源供核查。旧资源中没有 `v0.1.1` 至 `v0.1.8` 的可核实完整安装包，因此不补建空发行版。
+
+迁移脚本默认只读，可重新核对旧资源分组：
 
 ```bash
 node scripts/migrate-continuous-releases.mjs
 ```
 
-获得仓库维护者授权后执行 `node scripts/migrate-continuous-releases.mjs --apply`。脚本逐版创建对应提交的发行标签、下载并校验旧文件大小、上传到独立发行页；全部成功后才把 `continuous` 转为草稿。若 Pages 清单仍指向 `continuous`，脚本会拒绝归档，避免中断已安装客户端的更新。旧资源中没有 `v0.1.1` 至 `v0.1.8` 的可核实完整安装包，不补建空发行版。
+仅在需要恢复未完成迁移时，先确认各 `vX.Y.Z` 标签已经指向脚本内核实的源码提交，再由仓库维护者授权执行 `node scripts/migrate-continuous-releases.mjs --apply`。脚本校验远端标签、下载并核对旧文件大小、逐版上传到独立发行页；全部成功后才把 `continuous` 转为草稿。若 Pages 清单仍指向 `continuous`，脚本会拒绝归档，避免中断已安装客户端的更新。

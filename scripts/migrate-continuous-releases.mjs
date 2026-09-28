@@ -51,6 +51,18 @@ function gh(args) {
 
 function ghJson(args) { return JSON.parse(gh(args)) }
 
+function createDraftRelease({ version, tag, commit }) {
+  // 先用 Git 凭据核对已推送标签；gh 的凭据无 workflow scope，不能在建发行版时顺带创建标签。
+  const remote = execFileSync("git", ["ls-remote", "origin", `refs/tags/${tag}`], { encoding: "utf8" }).trim()
+  if (remote.split(/\s+/)[0] !== commit) throw new Error(`${tag} 的远端标签缺失或源码提交不符`)
+  execFileSync("gh", ["api", "-X", "POST", `repos/${REPO}/releases`,
+    "-f", `tag_name=${tag}`,
+    "-f", `name=CC Usage v${version}`,
+    "-f", `body=历史持续构建按版本归档。此页仅包含 v${version} 的原始安装包；对应源码提交 ${commit}。`,
+    "-F", "draft=true", "-F", "prerelease=false",
+  ], { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })
+}
+
 async function assertSafeToArchiveLegacy(plan) {
   const latest = ghJson(["release", "list", "--limit", "30", "--json", "tagName,isLatest"])
     .find((release) => release.isLatest)?.tagName
@@ -89,9 +101,7 @@ function migrateOne(release, existingTags) {
     }
 
     if (!existingTags.has(tag)) {
-      gh(["release", "create", tag, "--target", commit, "--title", `CC Usage v${version}`,
-        "--notes", `历史持续构建按版本归档。此页仅包含 v${version} 的原始安装包；对应源码提交 ${commit}。`,
-        "--draft", "--latest=false"])
+      createDraftRelease(release)
       existingTags.add(tag)
     }
     const current = ghJson(["release", "view", tag, "--json", "isDraft,assets"])

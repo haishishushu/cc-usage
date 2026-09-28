@@ -40,8 +40,7 @@ export function nextReleaseVersion(configVersion, assets = [], tags = []) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const release = JSON.parse(readFileSync(process.argv[2], "utf8"))
   const config = JSON.parse(readFileSync("backend/tauri.conf.json", "utf8"))
-  const tags = process.argv[3] ? readFileSync(process.argv[3], "utf8").split(/\r?\n/) : []
-  console.log(nextReleaseVersion(config.version, release.assets ?? [], tags))
+  const tags = readFileSync(process.argv[2], "utf8").split(/\r?\n/)
+  console.log(nextReleaseVersion(config.version, [], tags))
 }

@@ -31,16 +31,11 @@ jobs:
 
       - name: 计算下一个独立发行版本号
         id: next-version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release view continuous \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets > "$RUNNER_TEMP/continuous-release.json"
           git tag --list 'v*' > "$RUNNER_TEMP/version-tags.txt"
-          VERSION=$(node scripts/next-release-version.mjs "$RUNNER_TEMP/continuous-release.json" "$RUNNER_TEMP/version-tags.txt")
+          VERSION=$(node scripts/next-release-version.mjs "$RUNNER_TEMP/version-tags.txt")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "下一个独立发行版本号：$VERSION（标签 v$VERSION）"
 
