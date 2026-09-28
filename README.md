@@ -14,7 +14,7 @@
 An open-source desktop alternative to CLI usage counters like `ccusage` —
 英文文档见 [README.en.md](./README.en.md)。
 
-[下载安装](https://haishishushu.github.io/cc-usage-website/#/download) · [使用指南](#使用指南) · [项目架构](#项目架构) · [开发者指南](#开发者指南)
+[下载安装](https://haishishushu.github.io/cc-usage-website/#/download) · [使用指南](#使用指南) · [版本号规则](./docs/release-versioning.md) · [项目架构](#项目架构) · [开发者指南](#开发者指南)
 
 中文 | [English](./README.en.md)
 

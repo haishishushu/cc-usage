@@ -20,11 +20,27 @@ jobs:
     name: 更新持续构建标签
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next-version.outputs.version }}
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: 计算下一个持续构建版本号
+        id: next-version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view continuous \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets > "$RUNNER_TEMP/continuous-release.json"
+          VERSION=$(node scripts/next-release-version.mjs "$RUNNER_TEMP/continuous-release.json")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "下一个持续构建版本号：$VERSION"
 
       - name: 将 continuous 标签指向本次提交
         shell: bash
@@ -112,11 +128,12 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --dir frontend install --frozen-lockfile
 
-      # 持续构建版的补丁号取工作流运行号，保证每次发布版本号都严格递增；
-      # 否则 latest.json 永远是 conf 里写死的版本，已安装的用户永远收不到更新。
-      # 打 tag 的正式版不改写，用 tauri.conf.json 里的版本号。
+      # 主分支使用 prepare job 从已有安装包推算的统一版本号；
+      # 打 tag 的正式版仍使用 tauri.conf.json 中的版本号。
       - name: 生成持续构建版本号
         if: github.ref_type != 'tag'
+        env:
+          CONTINUOUS_VERSION: ${{ needs.prepare-continuous-release.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -124,8 +141,8 @@ jobs:
             const fs = require("fs");
             const path = "backend/tauri.conf.json";
             const conf = JSON.parse(fs.readFileSync(path, "utf8"));
-            const [major, minor] = conf.version.split(".");
-            const version = `${major}.${minor}.${process.env.GITHUB_RUN_NUMBER}`;
+            const version = process.env.CONTINUOUS_VERSION;
+            if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("持续构建版本号缺失或无效");
             conf.version = version;
             fs.writeFileSync(path, `${JSON.stringify(conf, null, 2)}\n`);
             // Cargo.toml 与 conf 保持一致，避免两处版本号各说各话
