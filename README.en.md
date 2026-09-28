@@ -15,7 +15,7 @@ A desktop island and full dashboard for local AI coding usage and provider quota
 
 [简体中文](./README.md) | English
 
-![CC Usage main panel](./docs/assets/readme/panel-overview.png)
+<img src="./docs/assets/readme/island-collapsed.png" alt="CC Usage desktop island" width="428" />
 
 </div>
 

@@ -15,7 +15,7 @@
 
 简体中文 | [English](./README.en.md)
 
-![CC Usage 主面板总览](./docs/assets/readme/panel-overview.png)
+<img src="./docs/assets/readme/island-collapsed.png" alt="CC Usage 桌面灵动岛" width="428" />
 
 </div>
 
