@@ -2038,6 +2038,9 @@ fn start_initialization(app: tauri::AppHandle, data_dir: std::path::PathBuf) {
         match result {
             Ok(()) => {
                 STARTUP_READY.store(true, Ordering::Release);
+                // 灵动岛 WebView 可能早于后台数据库初始化完成，通知它重读已保存的选择和连接。
+                let _ = app.emit("settings-changed", app.state::<Cfg>().0.get());
+                let _ = app.emit("connections-changed", ());
                 if STARTUP_REQUESTED.load(Ordering::Acquire) { show_main(&app); }
             }
             Err(error) => report_startup_error(&app, error),

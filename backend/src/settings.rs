@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     /// 仅 Windows 自动启动时不显示主面板；灵动岛仍按显示偏好运行。
     #[serde(default = "default_silent_startup")]
@@ -137,7 +138,7 @@ pub struct Store {
 impl Store {
     pub fn load(dir: &std::path::Path) -> Self {
         let path = dir.join("settings.json");
-        // 文件损坏或字段缺失时回落到默认值，不让应用起不来
+        // 缺失字段逐项补默认值，保留旧版本已经保存的连接；仅无法解析时回落。
         let inner = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
@@ -346,6 +347,24 @@ mod tests {
         // 再次替换已有文件，覆盖 Windows 上的保存与重启恢复路径。
         store.try_update(|s| s.theme = "system".into()).unwrap();
         assert_eq!(serde_json::to_value(store.get()).unwrap(), serde_json::to_value(super::Store::load(&dir).get()).unwrap());
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn upgrade_keeps_saved_island_connection_when_other_fields_are_missing() {
+        let dir = std::env::temp_dir().join(format!("island-upgrade-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"island_platform":"codex","island_kind":"auth","island_connection_id":"saved-account","island_connection_name":"上次使用的连接"}"#).unwrap();
+        let store = super::Store::load(&dir);
+        assert_eq!(store.get().island_connection_id.as_deref(), Some("saved-account"));
+        assert!(store.get().island_visible);
+        store.try_update(|s| s.theme = "dark".into()).unwrap();
+        let restored = super::Store::load(&dir).get();
+        assert_eq!(restored.island_connection_id.as_deref(), Some("saved-account"));
+        assert_eq!(restored.island_connection_name.as_deref(), Some("上次使用的连接"));
+        assert_eq!(restored.island_platform, "codex");
+        assert_eq!(restored.island_kind, "auth");
         std::fs::remove_file(dir.join("settings.json")).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }

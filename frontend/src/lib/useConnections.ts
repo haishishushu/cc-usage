@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { api, isTauri, listenEvent, type Candidate, type ConnectionDto } from "./api"
 import type { Connection, ConnectionKind, PlatformId } from "@/types"
 
@@ -46,6 +46,7 @@ export function useConnections() {
   const [candidateLoading, setCandidateLoading] = useState(false)
   const [live, setLive] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const loadRevision = useRef(0)
   /** 每行「获取」的独立状态，按连接 id 索引 */
   const [fetchState, setFetchState] = useState<Record<string, FetchState>>({})
   /** 最近一次「获取」扫描过的位置，界面据此说明读取范围 */
@@ -53,17 +54,20 @@ export function useConnections() {
 
   const reload = useCallback(async () => {
     if (!isTauri) return
+    const revision = ++loadRevision.current
     setLoading(true)
     try {
       const list = await api.listConnections()
+      if (revision !== loadRevision.current) return
       setConnections(list.map(toConnection))
       setLive(true)
       setError(null)
     } catch (reason) {
+      if (revision !== loadRevision.current) return
       setLive(false)
       setError(String(reason))
     } finally {
-      setLoading(false)
+      if (revision === loadRevision.current) setLoading(false)
     }
   }, [])
 
@@ -78,15 +82,21 @@ export function useConnections() {
   }, [])
 
   useEffect(() => {
-    void reload()
     let disposed = false
     let off: (() => void) | undefined
-    void listenEvent("connections-changed", () => void reload()).then((un) => {
+    void listenEvent("connections-changed", () => { if (!disposed) void reload() }).then((un) => {
       if (disposed) un()
-      else off = un
+      else {
+        off = un
+        // 先订阅再读取，避免错过数据库启动完成时的恢复通知。
+        void reload()
+      }
+    }).catch((reason) => {
+      if (!disposed) { setError(String(reason)); setLoading(false) }
     })
     return () => {
       disposed = true
+      loadRevision.current++
       off?.()
     }
   }, [reload, refreshCandidates])
