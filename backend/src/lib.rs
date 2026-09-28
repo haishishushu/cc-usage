@@ -22,6 +22,7 @@ mod creds;
 mod db;
 mod data_files;
 mod dock;
+mod main_window;
 mod pricing;
 mod proxy;
 mod proxy_config;
@@ -550,6 +551,8 @@ fn resize_island(app: tauri::AppHandle, width: f64, height: f64) -> Result<Optio
     if !width.is_finite() || !height.is_finite() || width < 8.0 || height < 8.0 {
         return Err("灵动岛尺寸无效".into());
     }
+    // 用户主动展开灵动岛后，不再按首次安装计时强制收成停靠条。
+    if height > 150.0 { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
     // 改尺寸后重新确认置顶：对应设置里默认开启的「灵动岛置顶」
     let _ = w.set_always_on_top(app.state::<Cfg>().0.get().always_on_top);
     let cfg = app.state::<Cfg>().0.get();
@@ -559,6 +562,9 @@ fn resize_island(app: tauri::AppHandle, width: f64, height: f64) -> Result<Optio
         return Ok(dock::work_area(&w).map(|area| area.3));
     } else {
         dock::resize_free(&w, width, height)?;
+        if FIRST_INSTALL_INTRO.load(Ordering::Acquire) {
+            dock::place_free_top_center(&w)?;
+        }
     }
     Ok(None)
 }
@@ -695,6 +701,7 @@ async fn request_log(
 
 #[tauri::command]
 fn island_drag(app: tauri::AppHandle) -> Result<(), String> {
+    FIRST_INSTALL_INTRO.store(false, Ordering::Release);
     let w = app.get_webview_window(ISLAND).ok_or("找不到灵动岛")?;
     dock::DRAGGING.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = dock::drag(&w);
@@ -722,6 +729,7 @@ fn island_topmost(app: tauri::AppHandle, on: bool) -> Result<settings::Settings,
 
 #[tauri::command]
 fn island_position(app: tauri::AppHandle, edge: Option<dock::Edge>) {
+    FIRST_INSTALL_INTRO.store(false, Ordering::Release);
     let cfg = app.state::<Cfg>();
     if let Some(edge) = edge {
         if let Some(w) = app.get_webview_window(ISLAND) {
@@ -844,6 +852,7 @@ fn set_autostart(on: bool) -> Result<bool, String> {
 
 #[tauri::command]
 fn set_dock_enabled(app: tauri::AppHandle, on: bool) -> Result<settings::Settings, String> {
+    if !on { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
     let next = app.state::<Cfg>().0.try_update(|settings| {
         settings.dock_enabled = on;
         if !on {
@@ -1832,6 +1841,123 @@ async fn read_local_connections(app: tauri::AppHandle, db: State<'_, Db>, platfo
 
 const ISLAND: &str = "island";
 const MAIN: &str = "main";
+const STARTUP: &str = "startup";
+
+static STARTUP_READY: AtomicBool = AtomicBool::new(false);
+static STARTUP_INITIALIZING: AtomicBool = AtomicBool::new(false);
+static STARTUP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MAIN_READY: AtomicBool = AtomicBool::new(false);
+static FIRST_INSTALL: AtomicBool = AtomicBool::new(false);
+static FIRST_INSTALL_INTRO: AtomicBool = AtomicBool::new(false);
+static MAIN_PLACEMENT: LazyLock<Mutex<Option<main_window::Placement>>> = LazyLock::new(|| Mutex::new(None));
+static STARTUP_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+fn persist_main_placement(app: &tauri::AppHandle, placement: main_window::Placement) {
+    if !placement.valid() { return; }
+    app.state::<Cfg>().0.update(|settings| settings.main_window = Some(placement));
+}
+
+fn record_main_window_event(window: &tauri::Window, event: &WindowEvent) {
+    if !MAIN_READY.load(Ordering::Acquire) { return; }
+    let placement = {
+        let Ok(mut current) = MAIN_PLACEMENT.lock() else { return };
+        let Some(placement) = current.as_mut() else { return };
+        let mut next = placement.clone();
+        match event {
+            WindowEvent::Moved(position) => { next.x = position.x; next.y = position.y; }
+            WindowEvent::Resized(size) => { next.width = size.width; next.height = size.height; }
+            WindowEvent::CloseRequested { .. } => {},
+            _ => return,
+        }
+        if !next.valid() { return; }
+        *placement = next.clone();
+        next
+    };
+    if matches!(event, WindowEvent::CloseRequested { .. }) {
+        persist_main_placement(window.app_handle(), placement);
+    }
+}
+
+fn show_startup(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let window = if let Some(window) = app.get_webview_window(STARTUP) {
+        window
+    } else {
+        WebviewWindowBuilder::new(app, STARTUP, WebviewUrl::App("startup.html".into()))
+            .title("CC Usage · 启动中")
+            .inner_size(360.0, 220.0)
+            .resizable(false)
+            .decorations(false)
+            .skip_taskbar(true)
+            .center()
+            .build()?
+    };
+    window.show()?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
+fn report_startup_error(app: &tauri::AppHandle, error: String) {
+    eprintln!("[启动] {error}");
+    if let Ok(mut current) = STARTUP_ERROR.lock() { *current = Some(error.clone()); }
+    if STARTUP_REQUESTED.load(Ordering::Acquire) {
+        let _ = show_startup(app);
+        let _ = app.emit("startup-error", error);
+    }
+}
+
+#[tauri::command]
+fn startup_error() -> Option<String> {
+    STARTUP_ERROR.lock().ok().and_then(|current| current.clone())
+}
+
+#[tauri::command]
+fn quit_startup(app: tauri::AppHandle) { app.exit(1); }
+
+#[tauri::command]
+fn retry_startup(app: tauri::AppHandle) -> Result<&'static str, String> {
+    if STARTUP_INITIALIZING.load(Ordering::Acquire) {
+        return Ok("initializing");
+    }
+    if let Ok(mut current) = STARTUP_ERROR.lock() { *current = None; }
+    if STARTUP_READY.load(Ordering::Acquire) {
+        if !MAIN_READY.load(Ordering::Acquire) {
+            if let Some(window) = app.get_webview_window(MAIN) {
+                window.destroy().map_err(|error| error.to_string())?;
+            }
+            show_main(&app);
+        } else {
+            show_main(&app);
+        }
+    } else {
+        let (data_dir, _) = data_paths(&app)?;
+        start_initialization(app, data_dir);
+    }
+    Ok("restarting")
+}
+
+#[tauri::command]
+fn main_panel_ready(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app.get_webview_window(MAIN).ok_or("主面板窗口不存在")?;
+    window.show().map_err(|error| error.to_string())?;
+    window.unminimize().map_err(|error| error.to_string())?;
+    if let Ok(mut placement) = MAIN_PLACEMENT.lock() {
+        *placement = main_window::capture(&window);
+    }
+    MAIN_READY.store(true, Ordering::Release);
+    let _ = window.set_focus();
+    if let Some(splash) = app.get_webview_window(STARTUP) { let _ = splash.close(); }
+    Ok(())
+}
+
+fn activate_existing_instance(app: &tauri::AppHandle) {
+    STARTUP_REQUESTED.store(true, Ordering::Release);
+    if STARTUP_READY.load(Ordering::Acquire) {
+        let settings = app.try_state::<Cfg>().map(|cfg| cfg.0.get()).unwrap_or_default();
+        show_main_with_intent(app, MainIntent::Overview { settings });
+    } else if let Err(error) = show_startup(app) {
+        eprintln!("[启动] 无法显示启动窗口: {error}");
+    }
+}
 
 /// 灵动岛正常由 tauri.conf 创建；若 WebView 被外部关闭或崩溃，托盘仍能按同一配置重建。
 fn ensure_island_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
@@ -1863,7 +1989,17 @@ fn ensure_island_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> 
 
 /// 主面板首次使用时才创建；关闭后 WebView 被销毁，后台采集与灵动岛继续运行。
 fn show_main(app: &tauri::AppHandle) {
-    let window = app.get_webview_window(MAIN).map(Ok).unwrap_or_else(|| {
+    if let Some(window) = app.get_webview_window(MAIN) {
+        if MAIN_READY.load(Ordering::Acquire) {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        } else { let _ = show_startup(app); }
+        return;
+    }
+    MAIN_READY.store(false, Ordering::Release);
+    if let Err(error) = show_startup(app) { eprintln!("[启动] 无法显示启动窗口: {error}"); }
+    let window = {
         WebviewWindowBuilder::new(app, MAIN, WebviewUrl::App("index.html".into()))
             .title("CC Usage")
             .inner_size(1128.0, 860.0)
@@ -1872,14 +2008,16 @@ fn show_main(app: &tauri::AppHandle) {
             .visible(false)
             .center()
             .build()
-    });
+    };
     match window {
         Ok(window) => {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
-        }
-        Err(error) => eprintln!("[窗口] 创建主面板失败: {error}"),
+            if let Some(saved) = app.try_state::<Cfg>().and_then(|cfg| cfg.0.get().main_window) {
+                if let Err(error) = main_window::restore(&window, &saved) {
+                    eprintln!("[窗口] 恢复主面板位置失败: {error}");
+                }
+            }
+        },
+        Err(error) => report_startup_error(app, format!("创建主面板失败：{error}")),
     }
 }
 
@@ -1892,8 +2030,131 @@ fn show_main_with_intent(app: &tauri::AppHandle, intent: MainIntent) {
     let _ = app.emit("main-intent", ());
 }
 
+fn start_initialization(app: tauri::AppHandle, data_dir: std::path::PathBuf) {
+    if STARTUP_INITIALIZING.swap(true, Ordering::AcqRel) { return; }
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = initialize_app(&app, &data_dir);
+        STARTUP_INITIALIZING.store(false, Ordering::Release);
+        match result {
+            Ok(()) => {
+                STARTUP_READY.store(true, Ordering::Release);
+                if STARTUP_REQUESTED.load(Ordering::Acquire) { show_main(&app); }
+            }
+            Err(error) => report_startup_error(&app, error),
+        }
+    });
+}
+
+fn initialize_app(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Result<(), String> {
+    if app.try_state::<Db>().is_none() {
+        let conn = db::open(&data_dir.join("usage.db")).map_err(|error| error.to_string())?;
+        effort_map::seed(&conn).map_err(|error| error.to_string())?;
+        app.manage(Db(Arc::new(Mutex::new(conn))));
+    }
+
+    // 恢复已有用户的停靠状态；首次安装先展示自由态灵动岛，再自动贴上边缘。
+    {
+        let cfg = app.state::<Cfg>().0.get();
+        let first_intro = FIRST_INSTALL.swap(false, Ordering::AcqRel)
+            && cfg.island_visible && cfg.dock_enabled && cfg.dock.edge.is_none();
+        if let Some(w) = app.get_webview_window(ISLAND) {
+            let _ = w.set_always_on_top(cfg.always_on_top);
+            if first_intro {
+                FIRST_INSTALL_INTRO.store(true, Ordering::Release);
+                if let Err(error) = dock::place_free_top_center(&w) {
+                    eprintln!("[启动] 灵动岛首次居中失败: {error}");
+                    let _ = w.center();
+                }
+            }
+        }
+        if let (true, Some(edge), Some(w)) = (cfg.dock_enabled, cfg.dock.edge, app.get_webview_window(ISLAND)) {
+            let _ = edge;
+            if let Some(monitor) = dock::restore_dock(&w, &cfg.dock) {
+                if cfg.dock.monitor.as_deref() != Some(&monitor) {
+                    app.state::<Cfg>().0.update(|settings| settings.dock.monitor = Some(monitor));
+                }
+            }
+        }
+        if let Some(w) = app.get_webview_window(ISLAND) {
+            if cfg.island_visible { let _ = w.show(); }
+            else { let _ = w.hide(); }
+        }
+        if first_intro {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if !FIRST_INSTALL_INTRO.swap(false, Ordering::AcqRel) { return; }
+                let settings = app.state::<Cfg>().0.get();
+                if settings.island_visible && settings.dock_enabled && settings.dock.edge.is_none() {
+                    island_position(app, Some(dock::Edge::Top));
+                }
+            });
+        }
+    }
+
+    if app.tray_by_id("main-tray").is_none() {
+        TrayIconBuilder::with_id("main-tray")
+            .icon({
+                let settings = app.state::<Cfg>().0.get();
+                tray_quota_icon(app, &tray_summary::current_state(app), settings.island_kind == "auth")
+            })
+            .show_menu_on_left_click(false)
+            .on_tray_icon_event(|tray, event| {
+                match &event {
+                    TrayIconEvent::Enter { position, .. } => tray_summary::enter(tray.app_handle(), position.x, position.y),
+                    TrayIconEvent::Leave { .. } | TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. } => tray_summary::close(tray.app_handle()),
+                    _ => {}
+                }
+                if matches!(event, TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Up, .. }) {
+                    if let Err(error) = context_menu::open(tray.app_handle(), false) { eprintln!("[菜单] {error}"); }
+                    return;
+                }
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event {
+                    let app = tray.app_handle();
+                    show_main_with_intent(
+                        app,
+                        MainIntent::Overview { settings: app.state::<Cfg>().0.get() },
+                    );
+                }
+            })
+            .build(app)
+            .map_err(|error| error.to_string())?;
+    }
+
+    // 后台采集与代理在数据库和托盘就位后启动，不阻塞启动窗口绘制。
+    if !validation::isolated() { watcher::start(app.clone()); }
+    if !validation::isolated() { watcher::start_config_sync(app.clone()); }
+    if !validation::isolated() { proxy::startup(app); }
+
+    if let Some(days) = app.state::<Cfg>().0.get().retention_days {
+        if let Ok(cutoff) = retention_cutoff(days) {
+            let database = app.state::<Db>().0.clone();
+            let cleanup_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match with_database(database, move |conn| {
+                    db::cleanup_history(conn, cutoff).map_err(|error| error.to_string())
+                }).await {
+                    Ok(result) if result.requests > 0 => {
+                        println!("[数据] 自动清理 {} 条过期请求", result.requests);
+                        let _ = cleanup_app.emit("refresh-requested", ());
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("[数据] 自动清理失败：{error}"),
+                }
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// 窗口操作成功后再同步设置、前端和托盘，避免显示状态与实际窗口脱节。
 fn set_island_visible(app: &tauri::AppHandle, visible: bool) -> tauri::Result<()> {
+    if !visible { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
     let window = if visible {
         Some(ensure_island_window(app)?)
     } else {
@@ -1934,6 +2195,9 @@ fn toggle_island(app: &tauri::AppHandle) -> tauri::Result<()> {
 /// 重置窗口位置（§2.6）：把灵动岛拉回主显示器、解除停靠，
 /// 主面板恢复默认尺寸与位置，同时恢复灵动岛的可见状态。
 fn reset_window_layout(app: &tauri::AppHandle) {
+    FIRST_INSTALL_INTRO.store(false, Ordering::Release);
+    app.state::<Cfg>().0.update(|settings| settings.main_window = None);
+    if let Ok(mut placement) = MAIN_PLACEMENT.lock() { *placement = None; }
     if let Some(w) = app.get_webview_window(ISLAND) {
         app.state::<Cfg>().0.update(|s| s.dock = Default::default());
         let _ = app.emit("settings-changed", app.state::<Cfg>().0.get());
@@ -1947,6 +2211,9 @@ fn reset_window_layout(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window(MAIN) {
         let _ = w.set_size(tauri::LogicalSize::new(1128.0, 860.0));
         let _ = w.center();
+        if let Ok(mut placement) = MAIN_PLACEMENT.lock() {
+            *placement = main_window::capture(&w);
+        }
     }
 }
 
@@ -2148,6 +2415,9 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            activate_existing_instance(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -2227,6 +2497,10 @@ pub fn run() {
             export_data,
             import_data,
             open_main_panel,
+            main_panel_ready,
+            startup_error,
+            retry_startup,
+            quit_startup,
             take_main_intent,
             fetch_remote_models,
             updater::check_app_update_available,
@@ -2236,109 +2510,34 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(updater::UpdateDownloadState::default());
+            let automatic = std::env::args_os().any(|arg| arg == "--autostart");
+            if !automatic {
+                STARTUP_REQUESTED.store(true, Ordering::Release);
+                let _ = show_startup(&handle);
+            }
 
-            // SQLite 放在应用数据目录，对应设置里只读显示的「数据库位置」
-            let data_dir = data_paths(&handle).map_err(std::io::Error::other)?.0;
-            let conn = db::open(&data_dir.join("usage.db")).expect("无法打开数据库");
-            // 思考强度字典与模型规则（画布 18）：幂等建表 + 内置已知档位/规则
-            effort_map::seed(&conn).expect("思考强度表初始化失败");
-            app.manage(Db(Arc::new(Mutex::new(conn))));
-            // 设置需在建托盘菜单前就位，否则菜单勾选态取不到持久化值
+            let data_dir = match data_paths(&handle) {
+                Ok((path, _)) => path,
+                Err(error) => {
+                    report_startup_error(&handle, error);
+                    return Ok(());
+                }
+            };
+            let first_install = !data_dir.join("settings.json").exists()
+                && !data_dir.join("usage.db").exists();
+            FIRST_INSTALL.store(first_install, Ordering::Release);
             app.manage(Cfg(settings::Store::load(&data_dir)));
             app.manage(settings::PlanQueryStore::load(&data_dir));
-            let startup_plan = startup::plan(
-                std::env::args_os().any(|arg| arg == "--autostart"),
-                app.state::<Cfg>().0.get().silent_startup,
-            );
-
-            // 恢复上次的停靠状态（§2.1.3）
-            {
-                let cfg = app.state::<Cfg>().0.get();
-                if let Some(w) = app.get_webview_window(ISLAND) {
-                    let _ = w.set_always_on_top(cfg.always_on_top);
-                }
-                if let (true, Some(edge), Some(w)) = (cfg.dock_enabled, cfg.dock.edge, app.get_webview_window(ISLAND)) {
-                    let _ = edge;
-                    if let Some(monitor) = dock::restore_dock(&w, &cfg.dock) {
-                        if cfg.dock.monitor.as_deref() != Some(&monitor) {
-                            app.state::<Cfg>().0.update(|settings| settings.dock.monitor = Some(monitor));
-                        }
-                    }
-                }
-                if let Some(w) = app.get_webview_window(ISLAND) {
-                    if cfg.island_visible { let _ = w.show(); }
-                    else { let _ = w.hide(); }
-                }
-            }
-
-
-            TrayIconBuilder::with_id("main-tray")
-                .icon({
-                    let settings = app.state::<Cfg>().0.get();
-                    tray_quota_icon(app.handle(), &tray_summary::current_state(app.handle()), settings.island_kind == "auth")
-                })
-                // 右键弹菜单，左键单击不弹
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    match &event {
-                        TrayIconEvent::Enter { position, .. } => tray_summary::enter(tray.app_handle(), position.x, position.y),
-                        TrayIconEvent::Leave { .. } | TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. } => tray_summary::close(tray.app_handle()),
-                        _ => {}
-                    }
-                    if matches!(event, TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Up, .. }) {
-                        if let Err(error) = context_menu::open(tray.app_handle(), false) { eprintln!("[菜单] {error}"); }
-                        return;
-                    }
-                    // 左键单击打开主面板；灵动岛显示状态由右键菜单控制。
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        show_main_with_intent(
-                            app,
-                            MainIntent::Overview { settings: app.state::<Cfg>().0.get() },
-                        );
-                    }
-                })
-                .build(app)?;
-
-            if startup_plan.show_main { show_main(app.handle()); }
-
-            // 先完成托盘初始化，再由后台监听线程执行首次采集并推送初值。
-            // 避免 setup 扫描大量历史日志，以及建菜单时争抢采集线程的数据库锁。
-            if !validation::isolated() { watcher::start(handle.clone()); }
-            // 配置文件自动同步：CC Switch 切换后连接立即跟随（默认常开，启动时先对齐一次）
-            if !validation::isolated() { watcher::start_config_sync(handle.clone()); }
-            // 本地代理：开关开着就恢复接管与监听；关着则清理崩溃残留的代理地址（自愈）。
-            // 接管会改写 CLI 本机配置，隔离测试模式绝不进入。
-            if !validation::isolated() { proxy::startup(&handle); }
-
-            // 只有用户在设置页显式选择过保留期才自动清理；默认 None 永不删除。
-            if let Some(days) = app.state::<Cfg>().0.get().retention_days {
-                if let Ok(cutoff) = retention_cutoff(days) {
-                    let database = app.state::<Db>().0.clone();
-                    let cleanup_app = handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        match with_database(database, move |conn| {
-                            db::cleanup_history(conn, cutoff).map_err(|error| error.to_string())
-                        }).await {
-                            Ok(result) if result.requests > 0 => {
-                                println!("[数据] 自动清理 {} 条过期请求", result.requests);
-                                let _ = cleanup_app.emit("refresh-requested", ());
-                            }
-                            Ok(_) => {}
-                            Err(error) => eprintln!("[数据] 自动清理失败：{error}"),
-                        }
-                    });
-                }
-            }
-
+            let startup_plan = startup::plan(automatic, app.state::<Cfg>().0.get().silent_startup, first_install);
+            STARTUP_REQUESTED.store(startup_plan.show_main, Ordering::Release);
+            if startup_plan.show_main { let _ = show_startup(&handle); }
+            start_initialization(handle, data_dir);
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == MAIN {
+                record_main_window_event(window, event);
+            }
             if window.label() == ISLAND {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
@@ -2388,6 +2587,11 @@ pub fn run() {
         // 正常退出前还原 CLI 直连配置，避免 CLI 指向已失效的本机代理端口；
         // 崩溃 / 强杀的残留由下次启动的 proxy::startup 自愈。
         if matches!(event, tauri::RunEvent::Exit { .. }) {
+            if let Ok(placement) = MAIN_PLACEMENT.lock() {
+                if let Some(placement) = placement.clone() {
+                    persist_main_placement(app, placement);
+                }
+            }
             proxy::shutdown_and_restore(app);
         }
     });

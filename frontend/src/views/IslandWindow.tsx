@@ -153,6 +153,8 @@ export function IslandWindow() {
     ? remainingDisplay(islandPlatform as PlatformId, islandKind, remainingQuota?.state ?? null)
     : null
   const refreshing = useRef(false)
+  const selectionRefreshKey = useRef<string | null>(null)
+  const refreshGeneration = useRef(0)
   // 刷新反馈动画的序号：任一入口触发刷新都递增，岛的三种形态据此重放动画
   const [refreshSerial, setRefreshSerial] = useState(0)
   // 刷新是否进行中：驱动绿色流光循环，直到全部查询完成再收尾
@@ -167,13 +169,18 @@ export function IslandWindow() {
     const refreshNetwork = (scanSessions: boolean) => {
       if (refreshing.current) return
       refreshing.current = true
+      const generation = refreshGeneration.current
       setRefreshSerial((value) => value + 1)
       setRefreshActive(true)
       const jobs: Array<Promise<unknown>> = [quota.refresh(), balance.refresh(), officialApiUsage.refresh()]
       if (islandPlatform === "grok" && islandKind === "auth") jobs.push(grokLocalQuota.refresh())
       if (islandPlatform === "zcode" && islandKind === "auth") jobs.push(zcodeLocalQuota.refresh())
       if (scanSessions) jobs.push(api.scanLocalSessions())
-      void Promise.all(jobs).catch(console.error).finally(() => { refreshing.current = false; setRefreshActive(false) })
+      void Promise.all(jobs).catch(console.error).finally(() => {
+        if (generation !== refreshGeneration.current) return
+        refreshing.current = false
+        setRefreshActive(false)
+      })
     }
     // 右键“立即刷新”：连同本机会话一起重扫。
     listen(listenEvent("island-refresh", () => refreshNetwork(true)))
@@ -182,8 +189,19 @@ export function IslandWindow() {
     listen(listenEvent<string | null>("refresh-requested", (connectionId) => {
       if (shouldRefreshConnection(connectionId, active?.id)) refreshNetwork(false)
     }))
+    // 主面板「启用」完成后 settings-changed 与连接列表可能先后到达。
+    // 等新连接实际成为灵动岛生效连接，再用它强制刷新额度与本机会话。
+    const selectedKey = active?.id && settings.island_connection_id === active.id
+      ? `${active.id}:${active.status}` : null
+    if (selectionRefreshKey.current !== selectedKey) {
+      selectionRefreshKey.current = selectedKey
+      refreshGeneration.current += 1
+      refreshing.current = false
+      if (selectedKey) refreshNetwork(true)
+      else setRefreshActive(false)
+    }
     return () => { disposed = true; offs.forEach((off) => off()) }
-  }, [active?.id, islandPlatform, islandKind, queries.quota, quota.refresh, grokLocalQuota.refresh, zcodeLocalQuota.refresh, balance.refresh, officialApiUsage.refresh])
+  }, [active?.id, active?.status, settings.island_connection_id, islandPlatform, islandKind, queries.quota, quota.refresh, grokLocalQuota.refresh, zcodeLocalQuota.refresh, balance.refresh, officialApiUsage.refresh])
   const displayQuota = remainingQuota ?? quota
   const quotaWindows =
     displayQuota.state?.state === "ok" ? toQuotaWindows(displayQuota.state.windows, quotaNow) : null

@@ -393,6 +393,14 @@
   }
 }
 
+.desktop-panel-entry {
+  transition: opacity 180ms var(--motion-ease), transform 180ms var(--motion-ease);
+}
+.desktop-panel-entry[data-panel-opening="true"] {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
 .motion-button {
   transition: transform 120ms var(--motion-ease), background-color 120ms ease,
     border-color 120ms ease, color 120ms ease, filter 120ms ease;

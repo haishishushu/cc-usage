@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CC Usage · 启动中</title>
+    <link rel="stylesheet" href="/src/startup.css" />
+  </head>
+  <body>
+    <main class="startup" role="status" aria-live="polite">
+      <header class="brand"><img src="/favicon.svg" alt="" /><span>CC Usage</span></header>
+      <div class="content">
+        <h1 id="title">正在打开主面板…</h1>
+        <p id="detail">正在准备本地数据</p>
+        <div class="track" aria-hidden="true"><span></span></div>
+      </div>
+      <div class="actions" id="actions" hidden>
+        <button id="retry" type="button">重试</button>
+        <button id="quit" type="button">退出</button>
+      </div>
+    </main>
+    <script type="module" src="/src/startup.ts"></script>
+  </body>
+</html>

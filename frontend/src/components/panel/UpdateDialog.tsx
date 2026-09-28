@@ -29,10 +29,10 @@ export function UpdateDialog() {
     <div role="dialog" aria-modal="true" aria-labelledby={titleId} className="motion-overlay absolute inset-0 z-20 grid place-items-center bg-black/25 p-8">
       <div className="motion-dialog flex w-[360px] max-w-full flex-col gap-3.5 rounded-xl border bg-surface p-5 shadow-dialog">
         <div className="flex items-center gap-3">
-          <span className={`grid size-10 place-items-center rounded-full bg-warn-soft ${installing ? "animate-pulse" : ""}`}>
-            {ready || downloaded ? <Check className="size-5 text-warn" aria-hidden />
-              : downloadError ? <Download className="size-5 text-warn" aria-hidden />
-                : <LoaderCircle className="size-5 animate-spin text-warn" aria-hidden />}
+          <span className={`grid size-10 place-items-center rounded-full ${downloadError ? "bg-danger-soft" : "bg-success-soft"} ${installing ? "animate-pulse" : ""}`}>
+            {ready || downloaded ? <Check className="size-5 text-success-text" aria-hidden />
+              : downloadError ? <Download className="size-5 text-danger" aria-hidden />
+                : <LoaderCircle className="size-5 animate-spin text-success-text" aria-hidden />}
           </span>
           <span className="flex flex-col gap-0.5">
             <span id={titleId} className="text-sm font-semibold text-text-primary">
@@ -52,7 +52,7 @@ export function UpdateDialog() {
         <div className="tnum flex items-center gap-2 rounded-lg bg-surface-2 px-3 py-2.5 font-mono text-xs">
           <span className="text-text-tertiary">v{info.currentVersion}</span>
           <span aria-hidden className="text-text-tertiary">→</span>
-          <span className="font-bold text-warn">v{info.availableVersion}</span>
+          <span className="font-bold text-success-text">v{info.availableVersion}</span>
           <span className="flex-1" />
           {info.pubDate && <span className="font-sans text-[10px] text-text-tertiary">{info.pubDate.slice(0, 10)} 发布</span>}
         </div>
@@ -74,13 +74,13 @@ export function UpdateDialog() {
               className="h-1.5 w-full overflow-hidden rounded-full bg-track"
             >
               <div
-                className="h-full rounded-full bg-warn transition-[width] duration-200"
+                className="h-full rounded-full bg-success transition-[width] duration-200"
                 style={{ width: `${percent === null ? 40 : percent}%` }}
               />
             </div>
             <div className="tnum flex justify-between font-mono text-[11px]">
               <span className="text-text-secondary">{bytes}</span>
-              <span className="font-bold text-warn">{percent === null ? "…" : `${percent}%`}</span>
+              <span className="font-bold text-success-text">{percent === null ? "…" : `${percent}%`}</span>
             </div>
           </div>
         )}
@@ -101,7 +101,7 @@ export function UpdateDialog() {
             <button
               type="button"
               onClick={downloadError ? startDownload : installDownloaded}
-              className="rounded-[8px] bg-warn px-4 py-2 text-xs font-semibold text-white transition-opacity hover:opacity-90"
+              className="rounded-[8px] bg-success-text px-4 py-2 text-xs font-semibold text-white transition-opacity hover:opacity-90 dark:bg-success dark:text-[#0f2a1a]"
             >
               {downloadError ? "重试下载" : "安装"}
             </button>

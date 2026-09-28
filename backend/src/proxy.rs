@@ -761,7 +761,8 @@ fn set_upstream(settings: &mut crate::settings::Settings, platform: ProxyPlatfor
 /// 应用退出时的收尾（RunEvent::Exit）：代理还开着就还原 CLI 配置，避免 CLI 指向失效端口。
 pub fn shutdown_and_restore(app: &tauri::AppHandle) {
     stop();
-    let settings = app.state::<crate::Cfg>().0.get();
+    let Some(store) = app.try_state::<crate::Cfg>() else { return; };
+    let settings = store.0.get();
     if settings.proxy_claude_upstream.is_some() || settings.proxy_codex_upstream.is_some() {
         if let Err(error) = crate::proxy_config::restore_all_saved(app) {
             eprintln!("[代理] 退出还原失败：{error}");

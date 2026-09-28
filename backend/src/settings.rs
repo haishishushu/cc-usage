@@ -55,6 +55,9 @@ pub struct Settings {
     /// 停靠状态：边缘与沿边偏移，重启后恢复（§2.1.3）
     #[serde(default)]
     pub dock: crate::dock::DockState,
+    /// 主面板上次的位置与尺寸；旧版设置缺少此字段时首次打开仍居中。
+    #[serde(default)]
+    pub main_window: Option<crate::main_window::Placement>,
     /// 本地代理（阶段二）：默认关闭，不开启时应用保持纯只读采集行为。
     #[serde(default)]
     pub proxy_enabled: bool,
@@ -116,6 +119,7 @@ impl Default for Settings {
             dnd: false,
             island_visible: true,
             dock: Default::default(),
+            main_window: None,
             proxy_enabled: false,
             proxy_port: default_proxy_port(),
             proxy_fallback_direct: default_proxy_fallback(),

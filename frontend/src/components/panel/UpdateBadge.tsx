@@ -32,7 +32,7 @@ export function UpdateBadge() {
         if (!busy && !ready && !waiting) startDownload()
       }}
       className={`flex h-6 shrink-0 items-center gap-1 rounded-full px-2 text-[11px] font-semibold ${
-        busy || ready || waiting ? "bg-warn-soft text-warn" : "bg-warn-soft text-warn hover:bg-warn hover:text-white transition-colors"
+        busy || ready || waiting ? "bg-success-soft text-success-text" : "bg-success-soft text-success-text hover:bg-success-text hover:text-white dark:hover:bg-success dark:hover:text-[#0f2a1a] transition-colors"
       }`}
     >
       {ready ? (

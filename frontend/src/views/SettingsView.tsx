@@ -94,7 +94,7 @@ function AboutUpdateRow() {
             <button
               type="button"
               onClick={startDownload}
-              className="flex items-center gap-1.5 rounded-[8px] bg-warn-soft px-3 py-1.5 text-xs font-semibold text-warn transition-colors hover:bg-warn hover:text-white"
+              className="flex items-center gap-1.5 rounded-[8px] bg-success-soft px-3 py-1.5 text-xs font-semibold text-success-text transition-colors hover:bg-success-text hover:text-white dark:hover:bg-success dark:hover:text-[#0f2a1a]"
             >
               <CircleArrowUp className="size-3.5" aria-hidden />
               更新 v{info.availableVersion}

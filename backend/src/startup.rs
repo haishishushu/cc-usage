@@ -1,8 +1,8 @@
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan { pub show_main: bool }
 
-pub fn plan(automatic: bool, silent: bool) -> Plan {
-    Plan { show_main: automatic && !silent }
+pub fn plan(automatic: bool, silent: bool, first_install: bool) -> Plan {
+    Plan { show_main: first_install || !automatic || !silent }
 }
 
 pub fn command(executable: &std::path::Path) -> String {
@@ -15,10 +15,11 @@ mod tests {
 
     #[test]
     fn silent_choice_applies_only_to_automatic_launches() {
-        assert_eq!(plan(false, false), Plan { show_main: false });
-        assert_eq!(plan(false, true), Plan { show_main: false });
-        assert_eq!(plan(true, false), Plan { show_main: true });
-        assert_eq!(plan(true, true), Plan { show_main: false });
+        assert_eq!(plan(false, false, false), Plan { show_main: true });
+        assert_eq!(plan(false, true, false), Plan { show_main: true });
+        assert_eq!(plan(true, false, false), Plan { show_main: true });
+        assert_eq!(plan(true, true, false), Plan { show_main: false });
+        assert_eq!(plan(true, true, true), Plan { show_main: true });
     }
 
     #[test]

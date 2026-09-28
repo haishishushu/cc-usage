@@ -153,6 +153,31 @@ pub fn centered_offset(win: &WebviewWindow, edge: Edge) -> Option<f64> {
     Some(edge_center(edge, width, height))
 }
 
+/// 首次安装先把自由态灵动岛放在主屏工作区上方居中，供用户发现入口。
+pub fn place_free_top_center(win: &WebviewWindow) -> Result<(), String> {
+    if let Some(monitor) = win.primary_monitor().map_err(|error| error.to_string())? {
+        let position = monitor.position();
+        let size = monitor.size();
+        let current_size = win.outer_size().map_err(|error| error.to_string())?;
+        win.set_position(PhysicalPosition::new(
+            position.x + (size.width as i32 - current_size.width as i32) / 2,
+            position.y + (size.height as i32 - current_size.height as i32) / 2,
+        )).map_err(|error| error.to_string())?;
+    }
+    let (wx, wy, ww, wh, scale, _) = work_area(win).ok_or("无法读取灵动岛工作区")?;
+    let size = win.outer_size().map_err(|error| error.to_string())?;
+    let left = (wx * scale).round() as i32;
+    let top = (wy * scale).round() as i32;
+    let width = (ww * scale).round() as i32;
+    let height = (wh * scale).round() as i32;
+    let x = left + (width - size.width as i32).max(0) / 2;
+    let y = top + (48.0 * scale).round() as i32;
+    win.set_position(PhysicalPosition::new(
+        x,
+        y.min(top + (height - size.height as i32).max(0)),
+    )).map_err(|error| error.to_string())
+}
+
 fn snap_hint(area: (f64, f64, f64, f64), rect: (f64, f64, f64, f64)) -> Option<SnapHint> {
     let (wx, wy, ww, wh) = area;
     let (x, y, w, h) = rect;

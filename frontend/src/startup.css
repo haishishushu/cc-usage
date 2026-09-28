@@ -1,0 +1,29 @@
+:root { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color-scheme: light dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+body { background: #f8fafc; color: #17243b; }
+.startup { display: flex; flex-direction: column; height: 100%; padding: 24px 27px; background: #f8fafc; border: 1px solid #dce3ed; border-radius: 14px; }
+.brand { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 700; letter-spacing: .01em; }
+.brand img { width: 21px; height: 21px; }
+.content { margin-top: 30px; }
+h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -.02em; }
+p { margin: 8px 0 0; color: #64748b; font-size: 12px; }
+.track { position: relative; height: 3px; margin-top: 24px; overflow: hidden; border-radius: 3px; background: #e3eaf4; }
+.track span { position: absolute; top: 0; bottom: 0; width: 32%; border-radius: inherit; background: #2563eb; animation: loading 1.4s ease-in-out infinite; }
+.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: auto; }
+.actions[hidden] { display: none; }
+button { min-width: 62px; border: 1px solid #cbd5e1; border-radius: 7px; padding: 6px 10px; background: #fff; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
+button:first-child { border-color: #2563eb; background: #2563eb; color: white; }
+button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.failed .track { display: none; }
+@keyframes loading { from { transform: translateX(-110%); } to { transform: translateX(315%); } }
+@media (prefers-color-scheme: dark) {
+  body, .startup { background: #111827; color: #edf2fa; }
+  .startup { border-color: #2d3a4c; }
+  p { color: #9baac1; }
+  .track { background: #2b3b55; }
+  .track span { background: #4f86f7; }
+  button { background: #1c2a3d; border-color: #45546b; }
+  button:first-child { background: #4f86f7; border-color: #4f86f7; color: #0c1422; }
+}
+@media (prefers-reduced-motion: reduce) { .track span { width: 45%; animation: none; } }

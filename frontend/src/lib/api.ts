@@ -393,6 +393,7 @@ export async function listenLiveUsage(
 export const api = {
   sourceMetrics: (platform: string, period: string, custom: CustomRange | null, model: string | null, queryEndMs: number) => invoke<SourceMetrics>("source_metrics", { platform, period, custom, model, queryEndMs }),
   openMainPanel: () => invoke<void>("open_main_panel"),
+  mainPanelReady: () => invoke<void>("main_panel_ready"),
   takeMainIntent: () => invoke<MainIntentDto | null>("take_main_intent"),
   menuAction: (id: string) => invoke<void>("menu_action", { id }),
   menuFit: (rootHeight: number) => invoke<{ root_x: number; root_y: number; root_width: number; sub_width: number; side: "left" | "right" }>("menu_fit", { rootHeight }),

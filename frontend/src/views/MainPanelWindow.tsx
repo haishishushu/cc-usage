@@ -12,7 +12,7 @@ import { SettingsView, type SettingsSection } from "./SettingsView"
 import type { PlatformId } from "@/types"
 
 /**
- * 主面板窗口 —— 宽 1128；关闭时由后端隐藏，后台采集继续运行。
+ * 主面板窗口 —— 宽 1128；关闭时销毁窗口，后台采集继续运行。
  * 一级导航只有「总览 / 设置」两项。
  *
  * 「当前查看平台」与「灵动岛显示平台」是两个相互独立的值（§7.3）：
@@ -37,9 +37,19 @@ export function MainPanelWindow({
   const [preferredConnectionId, setPreferredConnectionId] = useState<string | null>(null)
   const [openAddRequest, setOpenAddRequest] = useState(0)
   const [panelActive, setPanelActive] = useState(true)
+  const [opening, setOpening] = useState(embedded && isTauri)
+  const readySent = useRef(false)
   // 页面包含 fixed 弹窗，避免祖先 transform 改变弹窗的定位参照。
   const pageMotion = useContentMotion(tab, 180, 0)
   const aboutPresence = useExitPresence(about)
+
+  useEffect(() => {
+    if (!embedded || !isTauri || readySent.current) return
+    readySent.current = true
+    void api.mainPanelReady().then(() => setOpening(false)).catch((error) => {
+      console.error("主面板就绪通知失败", error)
+    })
+  }, [embedded])
 
   // 托盘菜单可以直接把主面板带到指定位置
   useEffect(() => {
@@ -116,9 +126,10 @@ export function MainPanelWindow({
     <ToastProvider>
     <UpdateProvider>
     <div
+      data-panel-opening={opening}
       className={
         embedded
-          ? "relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-bg"
+          ? "desktop-panel-entry relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-bg"
           : "relative flex flex-col overflow-hidden rounded-xl border bg-bg shadow-window"
       }
       style={embedded ? undefined : { width: PANEL_WIDTH, maxWidth: "100%" }}
