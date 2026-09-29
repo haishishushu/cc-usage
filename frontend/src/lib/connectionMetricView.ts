@@ -1,6 +1,7 @@
 import type { BalanceStateDto, QuotaStateDto } from "./api.ts"
 import { isPlanCovered } from "./planCoverage.ts"
 import { remainingDisplay } from "./remainingDisplay.ts"
+import { remainingPercent } from "./quota.ts"
 
 export type ConnectionMetricView = {
   mode: "plan" | "metered" | "native" | "unknown"
@@ -47,7 +48,7 @@ export function connectionMetricView(
       const percent = window?.used_percent
       return {
         label,
-        value: percent != null && Number.isFinite(percent) ? `已用 ${Math.round(percent)}%` : window?.amount_text ?? "—",
+        value: percent != null && Number.isFinite(percent) ? `剩余 ${Math.round(remainingPercent(percent))}%` : window?.amount_text ?? "—",
         title: window?.amount_text ?? undefined,
       }
     }

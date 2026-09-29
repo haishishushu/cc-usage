@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils"
 import { SHIMMER_CYCLE_MS, SHIMMER_MIN_CYCLES, useCycleExit } from "@/lib/motion"
-import { quotaBarClass } from "@/lib/quota"
+import { quotaBarClass, remainingPercent } from "@/lib/quota"
 import type { DockEdge, QuotaWindow } from "@/types"
 
 /**
@@ -81,9 +81,9 @@ export function DockedIsland({
         </span>
       )}
       {(unlimited ? [null, null] : quotas).map((q, index) => {
-        // unlimited：两条满格彩虹色；真实窗口按水位着色；不可用强制 0（空轨道）
+        // unlimited：两条满格彩虹色；真实窗口按剩余水位着色（填充=剩余，越用越短）；不可用强制 0（空轨道）
         // 每条都带位置标识；脉冲序号变化时重复 key 会导致旧轨道残留。
-        const pct = unlimited ? 100 : unavailable ? 0 : (q!.usedPercent ?? 0)
+        const pct = unlimited ? 100 : unavailable ? 0 : (q!.usedPercent == null ? 0 : remainingPercent(q!.usedPercent))
         const size = Math.round((INNER * pct) / 100)
         return (
           <div

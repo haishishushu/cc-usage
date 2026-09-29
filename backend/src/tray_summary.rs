@@ -187,9 +187,10 @@ fn summary(app: &tauri::AppHandle) -> Summary {
                         if cfg.island_kind == "api" && !has_plan_windows(windows) {
                             fill_api_key_usage(app, &mut summary, &key, &cfg.island_platform, *expires);
                         } else {
+                            // 口径统一为「剩余」（与 grok/zcode 分支及前端灵动岛一致）
                             summary.quotas = windows.iter().map(|window| Quota {
-                                key: window.key.clone(),
-                                value: window.used_percent.filter(|v| v.is_finite()).map(|v| format!("{:.0}%", v.clamp(0.0, 100.0)))
+                                key: format!("{} 剩余", window.key),
+                                value: remaining_percent(window.used_percent)
                                     .or_else(|| window.amount_text.clone()).unwrap_or("—".into()),
                             }).collect();
                             // 成功缓存 TTL 固定 5 分钟；由写入时刻计算，命中缓存不伪装为刚更新。

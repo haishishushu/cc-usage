@@ -5,8 +5,10 @@
  * 各家 Coding Plan 都走这个形态）；查不到这两个窗口的按 API Key 按量计费处理。
  *
  * 套餐制下单条请求不单独扣费，本地按公开价目表乘 Token 推算出的金额不是真实支出，
- * 因此请求日志的成本列显示「套餐内」，把真实的额度消耗放在悬停提示里，不编造金额。
+ * 因此请求日志的成本列显示「套餐内」，把额度余量放在悬停提示里，不编造金额。
  */
+import { remainingPercent } from "./quota.ts"
+
 export type PlanQuotaWindow = {
   key: string
   window_name: string
@@ -23,13 +25,13 @@ export function isPlanCovered(windows: readonly { key: string }[] | null | undef
   return Boolean(windows?.some((window) => PLAN_WINDOW_KEYS.includes(window.key)))
 }
 
-/** 悬停提示：原样透传来源给的额度文案，没有分母就退回百分比，都没有就只列窗口名 */
+/** 悬停提示：优先透传来源给的额度文案，没有分母就退回剩余百分比，都没有就只列窗口名 */
 export function planCoverageHint(windows: readonly PlanQuotaWindow[] | null | undefined): string | null {
   const parts = (windows ?? [])
     .filter((window) => PLAN_WINDOW_KEYS.includes(window.key))
     .map((window) => {
       if (window.amount_text) return `${window.window_name} ${window.amount_text}`
-      if (window.used_percent !== null) return `${window.window_name} 已用 ${window.used_percent}%`
+      if (window.used_percent !== null && Number.isFinite(window.used_percent)) return `${window.window_name} 剩余 ${Math.round(remainingPercent(window.used_percent))}%`
       return window.window_name
     })
   return parts.length ? parts.join(" · ") : null

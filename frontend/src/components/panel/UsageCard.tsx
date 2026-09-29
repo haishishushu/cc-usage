@@ -1,5 +1,5 @@
 import { cn } from "@/lib/utils"
-import { quotaBarClass, quotaLevelChipClass, quotaLevelLabel } from "@/lib/quota"
+import { quotaBarClass, quotaLevelChipClass, quotaLevelLabel, remainingPercent } from "@/lib/quota"
 import { ConnectionKindChip, StatusDot } from "@/components/ui/primitives"
 import { QueryStateNotice, type QueryState } from "./QueryStateNotice"
 import type { QuotaWindow } from "@/types"
@@ -15,7 +15,8 @@ const BADGE_TONE: Record<NonNullable<QuotaWindow["badgeTone"]>, string> = {
 }
 
 function WideQuotaRow({ quota }: { quota: QuotaWindow }) {
-  const pct = quota.usedPercent
+  // 显示口径：剩余（= 100 - 已用）
+  const pct = quota.usedPercent === null ? null : remainingPercent(quota.usedPercent)
   return (
     <div className="flex w-full flex-col gap-2.5">
       <div className="flex w-full items-center justify-between gap-x-4 gap-y-1">
@@ -43,7 +44,7 @@ function WideQuotaRow({ quota }: { quota: QuotaWindow }) {
             </span>
           )}
           <span className="tnum font-mono text-[13px] font-semibold text-text-primary">
-            {pct === null ? "—" : `${pct}%`}
+            {pct === null ? "—" : `剩余 ${pct}%`}
           </span>
         </div>
       </div>
