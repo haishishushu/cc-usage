@@ -1,5 +1,5 @@
 import { cn } from "@/lib/utils"
-import { quotaBarClass } from "@/lib/quota"
+import { quotaBarClass, remainingPercent } from "@/lib/quota"
 import type { QuotaWindow } from "@/types"
 
 /**
@@ -16,8 +16,8 @@ const BADGE_TONE: Record<NonNullable<QuotaWindow["badgeTone"]>, string> = {
 }
 
 export function UsageRow({ quota, showReset = true }: { quota: QuotaWindow; showReset?: boolean }) {
-  const pct = quota.usedPercent
-  // 无总量分母时不生成百分比进度条（§7.4）
+  // 显示口径：剩余（= 100 - 已用）。无总量分母时不生成百分比进度条（§7.4）
+  const pct = quota.usedPercent === null ? null : remainingPercent(quota.usedPercent)
   const hasBar = pct !== null
 
   return (
@@ -46,7 +46,7 @@ export function UsageRow({ quota, showReset = true }: { quota: QuotaWindow; show
         )}
       </div>
 
-      <span className="tnum whitespace-nowrap text-right font-mono text-xs text-text-primary">
+      <span className="tnum whitespace-nowrap text-right font-mono text-xs text-text-primary" title={quota.usedText ?? undefined}>
         {pct === null ? "—" : `${pct}%`}
       </span>
       {showReset && (

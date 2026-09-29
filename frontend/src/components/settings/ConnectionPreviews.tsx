@@ -8,7 +8,7 @@ import { useLiveToday } from "@/lib/useLiveUsage"
 import { onUsageChanged } from "@/lib/usageChanges"
 import { toQuotaWindows } from "@/lib/quotaMap"
 import { cn } from "@/lib/utils"
-import { balanceTextClass } from "@/lib/quota"
+import { balanceTextClass, remainingPercent } from "@/lib/quota"
 import type { Connection } from "@/types"
 
 /** `active` 为 false（主面板隐藏）时，各卡片暂停额度 / 余额 / 用量轮询与本机统计订阅，恢复后补查。 */
@@ -59,7 +59,7 @@ function ConnectionMetrics({ connection, active }: { connection: Connection; act
     {quota.state?.state === "ok" && quota.state.windows.length > 0 && <div className="flex flex-col gap-2">
       {toQuotaWindows(quota.state.windows, Date.now()).map(window => <div key={window.key} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-surface-2 px-3 py-2 text-xs">
         <span className="text-text-secondary">{window.windowName}</span>
-        <span className="font-mono text-text-primary">{window.usedPercent === null ? "—" : `${Math.round(window.usedPercent)}%`}{window.resetCountdown ? ` · ${window.resetCountdown}` : ""}</span>
+        <span className="font-mono text-text-primary">{window.usedPercent === null ? "—" : `剩 ${Math.round(remainingPercent(window.usedPercent))}%`}{window.resetCountdown ? ` · ${window.resetCountdown}` : ""}</span>
       </div>)}
     </div>}
     {quota.state?.state === "ok" && !quota.state.windows.length && <p className="text-xs text-text-secondary">来源未提供额度窗口</p>}
