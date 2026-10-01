@@ -32,7 +32,7 @@ test("悬停提示原样透传来源给的额度文案", () => {
 })
 
 test("来源没给分母时退回百分比，两者都没有就只列窗口名", () => {
-  assert.equal(planCoverageHint([w("5h", "5 小时额度", null, 62)]), "5 小时额度 已用 62%")
+  assert.equal(planCoverageHint([w("5h", "5 小时额度", null, 62)]), "5 小时额度 剩余 38%")
   assert.equal(planCoverageHint([w("5h", "5 小时额度")]), "5 小时额度")
 })
 

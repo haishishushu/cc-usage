@@ -7,7 +7,7 @@ const window = (key, used_percent) => ({ key, window_name: key, used_percent, am
 test("Auth 固定显示 5 小时和周额度，缺失窗口保持未知", () => {
   const view = connectionMetricView("auth", { state: "ok", plan: null, windows: [window("7d", 40)] }, null, null)
   assert.equal(view.mode, "plan")
-  assert.deepEqual(view.items.map((item) => item.value), ["—", "已用 40%"])
+  assert.deepEqual(view.items.map((item) => item.value), ["—", "剩余 60%"])
 })
 
 test("API Key 查到套餐窗口时显示双额度", () => {
