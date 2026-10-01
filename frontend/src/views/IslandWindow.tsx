@@ -1,5 +1,5 @@
 import { IslandMotion } from "@/components/island/IslandMotion"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { IslandCollapsed, IslandExpanded, type IslandData } from "@/components/island/UsageIsland"
 import { DockedIsland } from "@/components/island/DockedIsland"
 import type { DeltaPhase } from "@/components/island/TokenDelta"
@@ -10,7 +10,8 @@ import { useConnections } from "@/lib/useConnections"
 import { shouldRefreshConnection } from "@/lib/refreshScope"
 import { useApiUsage, useBalance, useCostEstimate, useQuota } from "@/lib/useQuota"
 import { formatQuotaCountdown, toQuotaWindows } from "@/lib/quotaMap"
-import { api, isTauri, listenEvent } from "@/lib/api"
+import { api, isTauri, listenEvent, type DockChangedEvent, type DockHintEvent } from "@/lib/api"
+import { isOwnIslandEvent, islandIdFromSearch, islandProfile } from "@/lib/islandProfile"
 import { createWindowSizeSync } from "@/lib/windowSizeSync"
 import { authQuotaRows } from "@/lib/authQuotaRows"
 import { collapseExpandedView, snapIndicatorVisible } from "@/lib/islandViewState"
@@ -120,9 +121,11 @@ export function IslandWindow() {
     return () => window.clearInterval(timer)
   }, [])
 
-  // 灵动岛显示的平台由持久化设置决定，与托盘子菜单同一个值
+  // 本岛身份：URL 带 clone 参数的是分身，否则是本体；连接与停靠按身份从设置里取
   const { settings } = useSettings()
-  const islandPlatform = settings.island_platform
+  const cloneId = useMemo(() => islandIdFromSearch(window.location.search), [])
+  const profile = islandProfile(settings, cloneId)
+  const islandPlatform = profile.platform
   const live = useLiveUsage(islandPlatform, true, settings.dnd, dragging)
   const collection = useCollectionStatus()
   // 接入方式来自本机真实配置，不写死
@@ -132,8 +135,8 @@ export function IslandWindow() {
   const { connections, loading: connectionsLoading } = useConnections()
   // 灵动岛生效连接：明确选择优先；未选择时自动启用当前平台第一个连接成功的
   // 连接（2026-09-19 鼠鼠定版）。仍不回退到本机账号或唯一候选。
-  const active = islandActiveConnection(settings.island_connection_id, connections, islandPlatform)
-  const islandKind = active?.kind ?? settings.island_kind
+  const active = islandActiveConnection(profile.connection_id, connections, islandPlatform)
+  const islandKind = active?.kind ?? profile.kind
   const localQuotaPlatform = (islandPlatform === "grok" || islandPlatform === "zcode") && islandKind === "auth"
   const queries = localQuotaPlatform
     ? { quota: null, balance: null, usage: null }
@@ -197,7 +200,7 @@ export function IslandWindow() {
     }))
     // 主面板「启用」完成后 settings-changed 与连接列表可能先后到达。
     // 等新连接实际成为灵动岛生效连接，再用它强制刷新额度与本机会话。
-    const selectedKey = active?.id && settings.island_connection_id === active.id
+    const selectedKey = active?.id && profile.connection_id === active.id
       ? `${active.id}:${active.status}` : null
     if (selectionRefreshKey.current !== selectedKey) {
       selectionRefreshKey.current = selectedKey
@@ -207,7 +210,7 @@ export function IslandWindow() {
       else setRefreshActive(false)
     }
     return () => { disposed = true; offs.forEach((off) => off()) }
-  }, [active?.id, active?.status, settings.island_connection_id, islandPlatform, islandKind, queries.quota, quota.refresh, grokLocalQuota.refresh, zcodeLocalQuota.refresh, balance.refresh, officialApiUsage.refresh])
+  }, [active?.id, active?.status, profile.connection_id, islandPlatform, islandKind, queries.quota, quota.refresh, grokLocalQuota.refresh, zcodeLocalQuota.refresh, balance.refresh, officialApiUsage.refresh])
   const displayQuota = remainingQuota ?? quota
   const quotaWindows =
     displayQuota.state?.state === "ok" ? toQuotaWindows(displayQuota.state.windows, quotaNow) : null
@@ -273,8 +276,8 @@ export function IslandWindow() {
           : officialApiUsage.state?.state === "ok" ? officialApiUsage.state.cost_reason ?? undefined
           : officialApiUsage.state?.reason ?? (officialApiUsage.loading ? "正在查询组织用量，暂显示本机统计" : undefined),
         todayTokenText: live.todayTokenText,
-        connectionLabel: active?.name ?? (settings.island_connection_id
-          ? `${settings.island_connection_name ?? "所选连接"}（不可用）`
+        connectionLabel: active?.name ?? (profile.connection_id
+          ? `${profile.connection_name ?? "所选连接"}（不可用）`
           : conn.label ?? undefined),
         sessions: sourceFailed ? live.sessions.map((session) => ({ ...session, state: "unknown" as const })) : live.sessions,
         sessionStatusUnknown: sourceFailed,
@@ -287,7 +290,7 @@ export function IslandWindow() {
         // 逐帧追数由叶子组件经 LiveCountsContext 订阅，岛体本身不随每帧重渲染
         deltaCountKey: "total",
         deltaPhase: live.deltaPhase,
-        status: nativeMonitor && active?.status === "connected" ? { tone: "success", label: "本机监控" } : islandConnectionStatus(active?.status ?? null, false, Boolean(settings.island_connection_id)),
+        status: nativeMonitor && active?.status === "connected" ? { tone: "success", label: "本机监控" } : islandConnectionStatus(active?.status ?? null, false, Boolean(profile.connection_id)),
         sourceText: `${collection.status && !collection.status.ok ? `采集异常：${collection.status.errors.join("；")} · ` : ""}${officialApiUsage.state?.state === "ok" ? `API 用量来源：${officialApiUsage.state.source} · ` : ""}统计来源：本机 ${PLATFORM_NAMES[islandPlatform] ?? islandPlatform} 会话记录（无法按账号区分）· ${live.activityKind === "running" ? "按本轮开始／结束事件及会话存活状态判断；思考、等待输入及压缩期间保留会话与 Token" : `${live.activeWindowSeconds} 秒内有新记录视为最近活跃`}`,
       }
     : {
@@ -309,11 +312,13 @@ export function IslandWindow() {
   useEffect(() => {
     let disposed = false
     let off: (() => void) | undefined
-    void listenEvent<{ edge: DockEdge; offset: number; centered: boolean } | null>("dock-hint", setSnapHint).then((un) => {
+    void listenEvent<DockHintEvent>("dock-hint", (event) => {
+      if (isOwnIslandEvent(event, cloneId)) setSnapHint(event.hint)
+    }).then((un) => {
       if (disposed) un(); else off = un
     })
     return () => { disposed = true; off?.() }
-  }, [])
+  }, [cloneId])
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (!isTauri || e.button !== 0 || e.detail > 1) return
     if ((e.target as HTMLElement).closest("button, input, a")) return
@@ -353,22 +358,22 @@ export function IslandWindow() {
   }, [])
 
   useEffect(() => {
-    resetDockView(settings.dock.edge)
-  }, [settings.dock.edge, resetDockView])
+    resetDockView(profile.dock.edge)
+  }, [profile.dock.edge, resetDockView])
 
   // 同一侧再次停靠时 edge 值没变，也必须退出探出/展开态并清掉旧定时器。
   useEffect(() => {
     let disposed = false
     let off: (() => void) | undefined
-    void listenEvent<{ edge: DockEdge | null }>("dock-changed", (dock) => {
-      resetDockView(dock.edge)
+    void listenEvent<DockChangedEvent>("dock-changed", (event) => {
+      if (isOwnIslandEvent(event, cloneId)) resetDockView(event.dock.edge)
     }).then((un) => { if (disposed) un(); else off = un })
     return () => {
       disposed = true
       off?.()
       if (peekTimer.current) window.clearTimeout(peekTimer.current)
     }
-  }, [resetDockView])
+  }, [resetDockView, cloneId])
 
   const undock = useCallback(() => {
     setPeek(false)
@@ -392,11 +397,11 @@ export function IslandWindow() {
   const collapseExpanded = useCallback(() => {
     if (peekTimer.current) window.clearTimeout(peekTimer.current)
     peekTimer.current = null
-    const next = collapseExpandedView(settings.dock.edge)
+    const next = collapseExpandedView(profile.dock.edge)
     if (next.edge) setEdge(next.edge)
     setPeek(next.peek)
     setMode(next.mode)
-  }, [settings.dock.edge])
+  }, [profile.dock.edge])
 
   // 阴影 0 2px 10px：窗口需为岛留出四周空白，否则被窗口边缘切掉
   const shellPad = isTauri && (mode !== "docked" || peek) ? "p-3.5" : ""
@@ -483,7 +488,7 @@ export function IslandWindow() {
               selectedId={active?.id}
               loading={connectionsLoading}
               onOpenChange={setConnectionMenuOpen}
-              onSelect={isTauri ? (id) => api.setIslandConnection(id) : undefined}
+              onSelect={isTauri ? (id) => api.setIslandConnection(id, cloneId) : undefined}
             />
           }
           onCollapse={collapseExpanded}

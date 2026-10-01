@@ -4,21 +4,29 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, Webvie
 
 const LABEL: &str = "context-menu";
 static ANCHOR: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// 本次菜单所属的灵动岛分身 id；None 表示本体或托盘。位置与分身操作据此定位目标岛。
+static TARGET: Mutex<Option<String>> = Mutex::new(None);
+
+#[derive(Clone, serde::Serialize)]
+pub struct MenuSource { island: bool, clone: Option<String> }
 
 fn fit_position(x: f64, y: f64, width: f64, height: f64, area: (f64, f64, f64, f64)) -> (f64, f64) {
     let (left, top, w, h) = area;
     (x.clamp(left, (left + w - width).max(left)), y.clamp(top, (top + h - height).max(top)))
 }
 
-pub fn open(app: &tauri::AppHandle, island: bool) -> Result<(), String> {
+pub fn open(app: &tauri::AppHandle, island: bool, clone: Option<String>) -> Result<(), String> {
     let cursor = app.cursor_position().map_err(|e| e.to_string())?;
     *ANCHOR.lock().map_err(|e| e.to_string())? = Some((cursor.x, cursor.y));
+    let clone = if island { clone } else { None };
+    *TARGET.lock().map_err(|e| e.to_string())? = clone.clone();
     if let Some(window) = app.get_webview_window(LABEL) {
-        window.emit("menu-reopen", island).map_err(|e| e.to_string())?;
+        window.emit("menu-reopen", MenuSource { island, clone }).map_err(|e| e.to_string())?;
         // 前端切回根菜单并完成布局后再更新尺寸，避免先撑大再收缩。
         return Ok(());
     }
-    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App(format!("index.html?window=menu&source={}", if island { "island" } else { "tray" }).into()))
+    let query = clone.as_deref().map(|id| format!("&clone={id}")).unwrap_or_default();
+    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App(format!("index.html?window=menu&source={}{query}", if island { "island" } else { "tray" }).into()))
         .title("CC Usage Menu").inner_size(292.0, 390.0)
         .decorations(false).transparent(true).shadow(false).resizable(false)
         .skip_taskbar(true).always_on_top(true).visible(false).focused(false)
@@ -103,11 +111,12 @@ pub fn menu_show(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn menu_action(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if !matches!(id.as_str(), "open_main" | "refresh" | "toggle_island" | "dnd" | "topmost" | "reset_layout" | "about" | "open_source_settings" | "pos_free" | "pos_top" | "pos_bottom" | "pos_left" | "pos_right" | "quit") {
+    if !matches!(id.as_str(), "open_main" | "refresh" | "toggle_island" | "dnd" | "topmost" | "reset_layout" | "about" | "open_source_settings" | "pos_free" | "pos_top" | "pos_bottom" | "pos_left" | "pos_right" | "clone_create" | "clone_destroy" | "quit") {
         return Err("不支持的菜单操作".into());
     }
-    // 操作先在后端接收，再销毁菜单，避免前端关闭后丢失 IPC。
-    super::handle_tray_menu(&app, &id);
+    let target = TARGET.lock().map_err(|e| e.to_string())?.clone();
+    // 操作先在后端接收，再销毁菜单，避免前端关闭后丢失 IPC；失败时菜单留下显示原因。
+    super::handle_tray_menu(&app, &id, target.as_deref())?;
     menu_close(app);
     Ok(())
 }

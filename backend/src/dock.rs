@@ -50,8 +50,8 @@ const BAR_LONG: f64 = 120.0;
 const BAR_SHORT: f64 = 14.0;
 
 /// 自由态收缩尺寸，解除停靠时恢复
-const FREE_W: f64 = 428.0;
-const FREE_H: f64 = 124.0;
+pub const FREE_W: f64 = 428.0;
+pub const FREE_H: f64 = 124.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,7 +74,7 @@ impl Edge {
 }
 
 /// 持久化的停靠状态（§2.1.3）：显示器 + 边缘 + 沿边偏移
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct DockState {
     pub edge: Option<Edge>,
     /// 沿边偏移：横边为 x，竖边为 y，单位为逻辑像素

@@ -21,7 +21,7 @@ async page => {
       api.menuClose=async()=>{};
       Client.createRoot(document.getElementById('root')).render(React.createElement(ContextMenuWindow));
     `}))
-    const rootLabels=['打开主面板','立即刷新','切换连接','显示位置','始终置顶']
+    const rootLabels=['打开主面板','立即刷新','切换连接','显示位置','始终置顶','开启分身','销毁分身']
     const open=async query=>{await probe.goto('http://localhost:5173/?window=menu&'+query);await probe.getByRole('menuitem',{name:'打开主面板',exact:true}).waitFor()}
     await open('source=island')
     const labels=await probe.getByRole('menu',{name:'灵动岛菜单',exact:true}).locator('button').allTextContents()

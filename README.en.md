@@ -168,6 +168,7 @@ Request duration, time to first token, and status codes are shown only when avai
 - Adjust opacity, island size, docked-bar size, refresh interval, and always-on-top preferences in Settings.
 - Do Not Disturb reduces notifications and motion without stopping collection.
 - Restore a hidden island from the main panel or tray menu.
+- **Right-click** the island for its menu: switch connection, position, always on top, and **Open clone / Close clone**. Each clone picks its own connection, docks and moves independently, and is restored after a restart. At least one island always remains; the number in the menu's top-right corner is the current island count.
 
 ### Tray and windows
 

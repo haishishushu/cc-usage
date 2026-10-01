@@ -313,6 +313,36 @@ export interface SnapResult {
   offset: number
 }
 
+/** 灵动岛分身（画布 22）：本体仍用 AppSettings 的 island_* 与 dock 字段 */
+export interface IslandCloneDto {
+  id: string
+  platform: string
+  kind: "auth" | "api"
+  connection_id: string | null
+  connection_name: string | null
+  source_id: string | null
+  dock: { edge: DockEdgeDto | null; offset: number; monitor: string | null }
+  /** 自由态左上角物理像素；null 表示尚未记录 */
+  position: [number, number] | null
+}
+
+/** 停靠事件带岛 id（本体为 null），各岛只处理自己的 */
+export interface DockChangedEvent {
+  island: string | null
+  dock: { edge: DockEdgeDto | null; offset: number; monitor: string | null }
+}
+
+export interface DockHintEvent {
+  island: string | null
+  hint: { edge: DockEdgeDto; offset: number; centered: boolean } | null
+}
+
+/** 右键菜单的来源：托盘或某个灵动岛（clone 为分身 id，本体为 null） */
+export interface MenuSourceEvent {
+  island: boolean
+  clone: string | null
+}
+
 /** 持久化设置（§2.6 / §7.3）。托盘与设置界面共享同一份值 */
 export interface AppSettings {
   silent_startup: boolean
@@ -335,6 +365,8 @@ export interface AppSettings {
   /** 免打扰：只暂停提示与动效，不停止采集与统计 */
   dnd: boolean
   island_visible: boolean
+  /** 分身列表；旧版设置缺少此字段时为空数组 */
+  island_clones: IslandCloneDto[]
   /** 本地代理：默认关闭，不开启时应用保持纯只读采集行为 */
   proxy_enabled: boolean
   proxy_port: number
@@ -494,8 +526,9 @@ export const api = {
   listSources: (platform: string) => invoke<SourceInfoDto[]>("list_sources", { platform }),
   setIslandPlatform: (platform: string) =>
     invoke<AppSettings>("set_island_platform", { platform }),
-  setIslandConnection: (id: string | null) =>
-    invoke<AppSettings>("set_island_connection", { id }),
+  /** island 为目标灵动岛的分身 id；null 为本体 */
+  setIslandConnection: (id: string | null, island: string | null = null) =>
+    invoke<AppSettings>("set_island_connection", { id, island }),
   setIslandSource: (id: string | null) =>
     invoke<AppSettings>("set_island_source", { id }),
   setDnd: (on: boolean) => invoke<AppSettings>("set_dnd", { on }),

@@ -12,6 +12,10 @@
 6. `performance.ps1 -Minutes 10` 每 15 秒保存进程树工作集、私有内存、CPU 累计时间与响应状态，报告位于 output/acceptance。每次测试须确认 processes.json 的 PID 仍属于本次进程。
 7. 完成后关闭 acceptance 浏览器，并仅停止 processes.json 中本次创建的 app/gateway PID。不要结束其他同名应用。
 
+## 灵动岛分身（画布 22）
+
+`island-clones.e2e.mjs` 直接用 Playwright 的 `connectOverCDP` 连接 9337，不经过 playwright-cli。在隔离应用启动后运行 `main` 阶段；结束应用、用同一隔离目录重启后再运行 `after-restart` 阶段。脚本会核对菜单顺序、右上角总数、销毁禁用、分身窗口与 `settings.json` 的 `island_clones` 一致，以及销毁本体时的接任。开发端口被系统排除时，用 `--config` 覆盖 `build.devUrl` 后再 `tauri dev`。
+
 环境变量 `CC_USAGE_TEST_DIR` 只在 debug 构建生效；路径必须为绝对路径且已有 `.acceptance-profile` 标记。正式安装包忽略该开关。CDP 端口仅由启动脚本设置，不写入产品代码。
 
 ## 真实只读接口

@@ -27,6 +27,7 @@ const DEFAULTS: AppSettings = {
   dock: { edge: null, offset: 0, monitor: null },
   dnd: false,
   island_visible: true,
+  island_clones: [],
   proxy_enabled: false,
   proxy_port: 12731,
   proxy_fallback_direct: true,
@@ -111,7 +112,7 @@ export function useSettings() {
   }, [])
 
   const setIslandPlatform = useCallback((platform: string) => save(() => api.setIslandPlatform(platform)), [save])
-  const setIslandConnection = useCallback((id: string | null) => save(() => api.setIslandConnection(id)), [save])
+  const setIslandConnection = useCallback((id: string | null, island: string | null = null) => save(() => api.setIslandConnection(id, island)), [save])
   const setIslandSource = useCallback((id: string | null) => save(() => api.setIslandSource(id)), [save])
   const setDnd = useCallback((on: boolean) => save(() => api.setDnd(on)), [save])
   const setDockEnabled = useCallback((on: boolean) => save(() => api.setDockEnabled(on)), [save])

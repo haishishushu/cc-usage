@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react"
-import { AppWindow, BellOff, Check, ChevronRight, Info, LayoutGrid, LogOut, Move, PanelBottom, PanelLeft, PanelRight, PanelTop, PanelTopOpen, Pin, RefreshCw, Settings } from "lucide-react"
-import { api, isTauri, listenEvent } from "@/lib/api"
+import { AppWindow, BellOff, Check, ChevronRight, CopyMinus, CopyPlus, Info, LayoutGrid, LogOut, Move, PanelBottom, PanelLeft, PanelRight, PanelTop, PanelTopOpen, Pin, RefreshCw, Settings } from "lucide-react"
+import { api, isTauri, listenEvent, type MenuSourceEvent } from "@/lib/api"
+import { cloneActions, islandCount, islandIdFromSearch, islandProfile } from "@/lib/islandProfile"
 import { useSettings } from "@/lib/useSettings"
 import { useConnections } from "@/lib/useConnections"
 import { cn } from "@/lib/utils"
@@ -8,6 +9,8 @@ import { PlatformLogo } from "@/components/brand/PlatformLogo"
 
 export function ContextMenuWindow() {
   const [islandMenu, setIslandMenu] = useState(() => new URLSearchParams(window.location.search).get("source") === "island")
+  // 右键所在的岛：分身 id 或本体 null。连接、位置、分身操作都作用于它。
+  const [cloneId, setCloneId] = useState<string | null>(() => islandIdFromSearch(window.location.search))
   const [reopenRequest, setReopenRequest] = useState(0)
   const { settings } = useSettings()
   const { connections, loading, error: connectionError } = useConnections()
@@ -30,10 +33,11 @@ export function ContextMenuWindow() {
     const refresh = () => { void api.menuRefreshing().then((v) => { if (!disposed) setRefreshing(v) }).catch(() => {}) }
     refresh()
     for (const name of ["menu-state-changed", "menu-reopen"]) {
-      void listenEvent<boolean>(name, (island) => {
+      void listenEvent<MenuSourceEvent>(name, (source) => {
         refresh()
         if (name === "menu-reopen") {
-          setIslandMenu(island)
+          setIslandMenu(source.island)
+          setCloneId(source.island ? source.clone : null)
           setPage("root")
           setBusy(false)
           setError(null)
@@ -84,9 +88,15 @@ export function ContextMenuWindow() {
     setError(null)
     try { await action() } catch (reason) { setError(String(reason)); setBusy(false) }
   }
+  // 目标岛的配置：本体读 island_*，分身读 island_clones 对应条目
+  const target = islandMenu ? cloneId : null
+  const profile = islandProfile(settings, target)
+  const total = islandCount(settings)
+  const { canCreate, canDestroy } = cloneActions(total)
   const icons: Partial<Record<string, typeof RefreshCw>> = {
     "打开主面板": PanelTopOpen, "立即刷新": RefreshCw, "刷新中…": RefreshCw,
     "显示灵动岛": PanelTop, "切换连接": LayoutGrid, "显示位置": Move, "始终置顶": Pin, "免打扰": BellOff,
+    "开启分身": CopyPlus, "销毁分身": CopyMinus,
     "重置窗口位置": Move, "设置": Settings, "关于 CC Usage": Info, "退出": LogOut,
   }
   const row = (label: string, action: () => void, options: { checked?: boolean; sub?: "connections" | "position"; radio?: boolean; disabled?: boolean; danger?: boolean; platform?: "claude" | "codex"; itemIcon?: typeof RefreshCw } = {}) => {
@@ -150,6 +160,10 @@ export function ContextMenuWindow() {
       <div ref={ref} tabIndex={-1} role="menu" aria-label={islandMenu ? "灵动岛菜单" : "托盘菜单"}
         className={panelClass} style={{ left: rootX, top: rootY, width: rootWidth, visibility: isTauri && !layout ? "hidden" : undefined }}
         onPointerEnter={cancelClose} onPointerLeave={closeLater} onKeyDown={(event) => keyDown(event)}>
+          {islandMenu && (
+            // 画布 22：面板右上角的纯数字 = 灵动岛总数（含本体）
+            <span aria-label={`当前 ${total} 个灵动岛`} className="tnum pointer-events-none absolute right-3 top-[14px] font-mono text-[11px] font-semibold leading-none text-text-tertiary">{total}</span>
+          )}
           {row("打开主面板", command("open_main"))}
           {row(refreshing ? "刷新中…" : "立即刷新", command("refresh"), { disabled: refreshing })}
           {separator}
@@ -157,6 +171,11 @@ export function ContextMenuWindow() {
           {row("切换连接", () => openSub("connections"), { sub: "connections", disabled: !settings.island_visible })}
           {row("显示位置", () => openSub("position"), { sub: "position", disabled: !settings.island_visible })}
           {row("始终置顶", command("topmost"), { checked: settings.always_on_top })}
+          {islandMenu && <>
+          {separator}
+          {row("开启分身", command("clone_create"), { disabled: !canCreate })}
+          {row("销毁分身", command("clone_destroy"), { disabled: !canDestroy })}
+          </>}
           {!islandMenu && <>
           {row("免打扰", command("dnd"), { checked: settings.dnd })}
           {separator}
@@ -173,7 +192,7 @@ export function ContextMenuWindow() {
         onPointerEnter={cancelClose} onPointerLeave={closeLater} onKeyDown={(event) => keyDown(event, true)}>
         {page === "position" && ([
           ["free", "自由悬浮", AppWindow], ["top", "上边居中", PanelTop], ["bottom", "下边居中", PanelBottom], ["left", "左边居中", PanelLeft], ["right", "右边居中", PanelRight],
-        ] as const).map(([id, label, itemIcon]) => row(label, command(`pos_${id}`), { radio: true, itemIcon, checked: (settings.dock.edge ?? "free") === id }))}
+        ] as const).map(([id, label, itemIcon]) => row(label, command(`pos_${id}`), { radio: true, itemIcon, checked: (profile.dock.edge ?? "free") === id }))}
         {page === "connections" && <>
           {loading && <p className="flex items-center gap-2 p-3 text-xs text-text-tertiary"><RefreshCw className="size-3 animate-spin" />正在读取连接…</p>}
           {connectionError && <p role="alert" className="p-2 text-xs text-danger">连接读取失败：{connectionError}</p>}
@@ -181,8 +200,8 @@ export function ContextMenuWindow() {
             const found = connections.filter((c) => c.platformId === platform && c.kind === kind)
             const name = `${platform === "claude" ? "Claude" : "Codex"} · ${kind === "auth" ? "Auth" : "API Key"}`
             return found.length ? found.map((c) => row(`${name} · ${c.name}`, () => {
-              void act(async () => { await api.setIslandConnection(c.id); await api.menuClose() })
-            }, { radio: true, checked: c.id === settings.island_connection_id, disabled: c.status !== "connected", platform })) : islandMenu ? [] : [row(`${name}（未配置）`, () => {}, { disabled: true, platform })]
+              void act(async () => { await api.setIslandConnection(c.id, target); await api.menuClose() })
+            }, { radio: true, checked: c.id === profile.connection_id, disabled: c.status !== "connected", platform })) : islandMenu ? [] : [row(`${name}（未配置）`, () => {}, { disabled: true, platform })]
           }))}
           {islandMenu && !loading && !connectionError && connections.length === 0 && <p className="p-3 text-xs text-text-tertiary">暂无连接，请在主面板添加</p>}
           {separator}{row("管理连接…", command("open_source_settings"))}

@@ -870,7 +870,7 @@ export function SettingsView({
               exiting={dialogExiting}
               connection={shownDialog.c}
               /* 被移除的连接正是灵动岛当前配置时，才显示橙色警示（§6.3） */
-              usedByIsland={shownDialog.c.id === cfg.settings.island_connection_id}
+              usedByIsland={shownDialog.c.id === cfg.settings.island_connection_id || cfg.settings.island_clones.some((clone) => clone.connection_id === shownDialog.c.id)}
               onClose={() => setDialog(null)}
               onConfirm={async () => {
                 await conn.remove(shownDialog.c.id)

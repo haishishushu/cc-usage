@@ -295,7 +295,7 @@ export function ConnectionTable(props: Props) {
     </>}
     {error && rows.length > 0 && <div role="alert" className="flex items-center justify-between gap-3 text-xs text-danger"><span>{error}</span><Button onClick={onRetry}>重试</Button></div>}
     <p className="text-[11px] leading-relaxed text-text-tertiary">
-      同时仅使用一个灵动岛连接（跨平台唯一）。当前使用中：{using ? `${platformConfig(using.platformId).name} · ${using.name}` : "无"}。
+      灵动岛本体同时仅使用一个连接（跨平台唯一），分身可在右键菜单各自选择。当前本体使用中：{using ? `${platformConfig(using.platformId).name} · ${using.name}` : "无"}。
     </p>
     <p className="text-[11px] leading-relaxed text-text-tertiary">断开保留配置、凭证与历史；本机 Token 和积分按平台汇总，无法区分具体账号或 Key；WorkBuddy 已上报积分不是剩余额度。点击「检测」会重新查询当前行的额度与用量。</p>
   </div>

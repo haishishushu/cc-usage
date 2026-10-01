@@ -22,6 +22,7 @@ mod creds;
 mod db;
 mod data_files;
 mod dock;
+mod island_clones;
 mod main_window;
 mod pricing;
 mod proxy;
@@ -48,7 +49,7 @@ use tauri::{
     Emitter,
     image::Image,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
 
@@ -669,28 +670,80 @@ async fn scan_local_sessions(app: tauri::AppHandle, db: State<'_, Db>) -> Result
     Ok(result)
 }
 
+/// 调用方窗口必须是灵动岛（本体或分身），返回其分身 id（本体为 None）。
+fn island_id_of(window: &WebviewWindow) -> Result<Option<String>, String> {
+    island_clones::id_from_label(window.label()).ok_or_else(|| "只有灵动岛窗口能执行此操作".to_string())
+}
+
+fn island_dock(settings: &settings::Settings, id: Option<&str>) -> dock::DockState {
+    island_clones::profile(settings, id).map(|profile| profile.dock).unwrap_or_default()
+}
+
+fn island_window(app: &tauri::AppHandle, id: Option<&str>) -> Option<WebviewWindow> {
+    app.get_webview_window(&island_clones::label(id))
+}
+
+/// 当前存活的全部灵动岛窗口（本体 + 分身）。
+fn island_windows(app: &tauri::AppHandle) -> Vec<WebviewWindow> {
+    app.webview_windows().into_iter()
+        .filter(|(label, _)| island_clones::is_island_label(label))
+        .map(|(_, window)| window)
+        .collect()
+}
+
+/// 本体在前、分身在后的全部岛 id。
+fn island_ids(settings: &settings::Settings) -> Vec<Option<String>> {
+    std::iter::once(None).chain(settings.island_clones.iter().map(|clone| Some(clone.id.clone()))).collect()
+}
+
+/// 停靠事件带上岛 id；各岛窗口只处理自己的，不会被别的岛的停靠变化重置形态。
+#[derive(Clone, serde::Serialize)]
+struct DockChangedEvent { island: Option<String>, dock: dock::DockState }
+
+#[derive(Clone, serde::Serialize)]
+struct DockHintEvent { island: Option<String>, hint: Option<dock::SnapHint> }
+
+fn emit_dock_changed(app: &tauri::AppHandle, id: Option<&str>, dock: &dock::DockState) {
+    let _ = app.emit("dock-changed", DockChangedEvent { island: id.map(str::to_string), dock: dock.clone() });
+}
+
+fn store_island_dock(app: &tauri::AppHandle, id: Option<&str>, dock: dock::DockState) -> settings::Settings {
+    app.state::<Cfg>().0.update(|settings| { island_clones::set_dock(settings, id, dock); })
+}
+
+/// 分身的自由态位置只在拖动结束、创建与重置时记录，不在每次移动回调里落盘。
+fn remember_clone_position(app: &tauri::AppHandle, id: &str, window: &WebviewWindow) {
+    let Ok(position) = window.outer_position() else { return };
+    let store = &app.state::<Cfg>().0;
+    let changed = store.get().island_clones.iter()
+        .any(|clone| clone.id == id && clone.position != Some((position.x, position.y)));
+    if changed {
+        store.update(|settings| { island_clones::set_position(settings, id, (position.x, position.y)); });
+    }
+}
+
 /// 灵动岛窗口尺寸跟随内容。收缩 / 展开 / 停靠三态高度差很大（展开态有会话列表），
-/// 写死会把内容截断——由前端测量实际内容后调用本命令。
+/// 写死会把内容截断——由前端测量实际内容后调用本命令。调用方窗口即目标岛。
 #[tauri::command]
-fn resize_island(app: tauri::AppHandle, width: f64, height: f64) -> Result<Option<f64>, String> {
-    let Some(w) = app.get_webview_window(ISLAND) else {
-        return Err("找不到灵动岛窗口".into());
-    };
+fn resize_island(app: tauri::AppHandle, window: WebviewWindow, width: f64, height: f64) -> Result<Option<f64>, String> {
+    let id = island_id_of(&window)?;
+    let w = window;
     if !width.is_finite() || !height.is_finite() || width < 8.0 || height < 8.0 {
         return Err("灵动岛尺寸无效".into());
     }
-    // 用户主动展开灵动岛后，不再按首次安装计时强制收成停靠条。
-    if height > 150.0 { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
-    // 改尺寸后重新确认置顶：对应设置里默认开启的「灵动岛置顶」
-    let _ = w.set_always_on_top(app.state::<Cfg>().0.get().always_on_top);
+    // 用户主动展开本体后，不再按首次安装计时强制收成停靠条。
+    if id.is_none() && height > 150.0 { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
     let cfg = app.state::<Cfg>().0.get();
-    if let Some(edge) = cfg.dock.edge {
-        dock::anchor(&w, edge, cfg.dock.offset, width, height)?;
+    // 改尺寸后重新确认置顶：对应设置里默认开启的「灵动岛置顶」
+    let _ = w.set_always_on_top(cfg.always_on_top);
+    let dock_state = island_dock(&cfg, id.as_deref());
+    if let Some(edge) = dock_state.edge {
+        dock::anchor(&w, edge, dock_state.offset, width, height)?;
         // 把停靠窗口的实际工作区上限交给前端，避免动画等待不可达高度。
         return Ok(dock::work_area(&w).map(|area| area.3));
     } else {
         dock::resize_free(&w, width, height)?;
-        if FIRST_INSTALL_INTRO.load(Ordering::Acquire) {
+        if id.is_none() && FIRST_INSTALL_INTRO.load(Ordering::Acquire) {
             dock::place_free_top_center(&w)?;
         }
     }
@@ -828,51 +881,54 @@ async fn request_log(
 }
 
 #[tauri::command]
-fn island_drag(app: tauri::AppHandle) -> Result<(), String> {
-    FIRST_INSTALL_INTRO.store(false, Ordering::Release);
-    let w = app.get_webview_window(ISLAND).ok_or("找不到灵动岛")?;
+fn island_drag(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
+    let id = island_id_of(&window)?;
+    if id.is_none() { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
+    let w = window;
     dock::DRAGGING.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = dock::drag(&w);
     dock::DRAGGING.store(false, std::sync::atomic::Ordering::Relaxed);
-    let _ = app.emit("dock-hint", Option::<dock::SnapHint>::None);
+    let _ = app.emit("dock-hint", DockHintEvent { island: id.clone(), hint: None });
     result?;
-    let cfg = app.state::<Cfg>();
-    let _ = dock_release(app.clone(), cfg);
+    let snapped = dock_release_for(&app, &w, id.as_deref());
+    if let (Some(id), None) = (id.as_deref(), snapped) { remember_clone_position(&app, id, &w); }
     let _ = app.emit("settings-changed", app.state::<Cfg>().0.get());
     Ok(())
 }
 
+/// 置顶是全局开关：对本体与全部分身同时生效。
 #[tauri::command]
 fn island_topmost(app: tauri::AppHandle, on: bool) -> Result<settings::Settings, String> {
-    let w = app.get_webview_window(ISLAND).ok_or("找不到灵动岛")?;
+    let windows = island_windows(&app);
+    if windows.is_empty() { return Err("找不到灵动岛".into()); }
     let previous = app.state::<Cfg>().0.get().always_on_top;
-    w.set_always_on_top(on).map_err(|e| e.to_string())?;
+    for w in &windows { w.set_always_on_top(on).map_err(|e| e.to_string())?; }
     let next = match app.state::<Cfg>().0.try_update(|s| s.always_on_top = on) {
         Ok(next) => next,
-        Err(error) => { let _ = w.set_always_on_top(previous); return Err(error); }
+        Err(error) => { for w in &windows { let _ = w.set_always_on_top(previous); } return Err(error); }
     };
     let _ = app.emit("settings-changed", &next);
     Ok(next)
 }
 
+/// 右键菜单「显示位置」：`island` 为目标岛（None 为本体）。
 #[tauri::command]
-fn island_position(app: tauri::AppHandle, edge: Option<dock::Edge>) {
-    FIRST_INSTALL_INTRO.store(false, Ordering::Release);
-    let cfg = app.state::<Cfg>();
+fn island_position(app: tauri::AppHandle, edge: Option<dock::Edge>, island: Option<String>) {
+    let id = island.as_deref();
+    if id.is_none() { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
+    let Some(w) = island_window(&app, id) else { return };
     if let Some(edge) = edge {
-        if let Some(w) = app.get_webview_window(ISLAND) {
-            let Some(offset) = dock::centered_offset(&w, edge) else { return };
-            dock::apply_dock(&w, edge, offset);
-            // 窗口 API 会跨线程等待主事件循环；禁止在设置锁内调用，移动回调也会读取设置。
-            let monitor = w.current_monitor().ok().flatten().and_then(|m| m.name().cloned());
-            cfg.0.update(|s| s.dock = dock::DockState { edge: Some(edge), offset,
-                monitor });
-        }
+        let Some(offset) = dock::centered_offset(&w, edge) else { return };
+        dock::apply_dock(&w, edge, offset);
+        // 窗口 API 会跨线程等待主事件循环；禁止在设置锁内调用，移动回调也会读取设置。
+        let monitor = w.current_monitor().ok().flatten().and_then(|m| m.name().cloned());
+        store_island_dock(&app, id, dock::DockState { edge: Some(edge), offset, monitor });
     } else {
-        dock_undock(app.clone(), app.state::<Cfg>());
+        dock_undock_for(&app, &w, id);
     }
-    let _ = app.emit("settings-changed", cfg.0.get());
-    let _ = app.emit("dock-changed", cfg.0.get().dock);
+    let settings = app.state::<Cfg>().0.get();
+    let _ = app.emit("settings-changed", &settings);
+    emit_dock_changed(&app, id, &island_dock(&settings, id));
 }
 
 fn data_paths(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
@@ -985,12 +1041,13 @@ fn set_dock_enabled(app: tauri::AppHandle, on: bool) -> Result<settings::Setting
         settings.dock_enabled = on;
         if !on {
             settings.dock = Default::default();
+            for clone in &mut settings.island_clones { clone.dock = Default::default(); }
         }
     })?;
     if !on {
-        if let Some(window) = app.get_webview_window(ISLAND) { dock::undock(&window); }
+        for window in island_windows(&app) { dock::undock(&window); }
     }
-    let _ = app.emit("dock-changed", next.dock.clone());
+    for id in island_ids(&next) { emit_dock_changed(&app, id.as_deref(), &island_dock(&next, id.as_deref())); }
     let _ = app.emit("settings-changed", next.clone());
     Ok(next)
 }
@@ -1098,53 +1155,59 @@ fn main_drag(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn island_menu(app: tauri::AppHandle, refreshing: bool) -> Result<(), String> {
+async fn island_menu(app: tauri::AppHandle, window: WebviewWindow, refreshing: bool) -> Result<(), String> {
     let _ = refreshing;
-    context_menu::open(&app, true)
+    let id = island_id_of(&window)?;
+    context_menu::open(&app, true, id)
 }
 
 #[tauri::command]
-fn dock_hover(app: tauri::AppHandle) -> Option<dock::Edge> {
+fn dock_hover(app: tauri::AppHandle, window: WebviewWindow) -> Option<dock::Edge> {
     if !app.state::<Cfg>().0.get().dock_enabled {
         return None;
     }
-    app.get_webview_window(ISLAND).and_then(|w| dock::hover_edge(&w))
+    island_id_of(&window).ok()?;
+    dock::hover_edge(&window)
 }
 
 /// 松手：够近则吸附并落位，否则保持自由态
 #[tauri::command]
-fn dock_release(app: tauri::AppHandle, cfg: State<Cfg>) -> Option<dock::SnapResult> {
-    if !cfg.0.get().dock_enabled {
-        cfg.0.update(|settings| settings.dock = Default::default());
-        let _ = app.emit("dock-changed", cfg.0.get().dock);
+fn dock_release(app: tauri::AppHandle, window: WebviewWindow) -> Result<Option<dock::SnapResult>, String> {
+    let id = island_id_of(&window)?;
+    Ok(dock_release_for(&app, &window, id.as_deref()))
+}
+
+fn dock_release_for(app: &tauri::AppHandle, w: &WebviewWindow, id: Option<&str>) -> Option<dock::SnapResult> {
+    let store = &app.state::<Cfg>().0;
+    if !store.get().dock_enabled {
+        store.update(|settings| { island_clones::set_dock(settings, id, Default::default()); });
+        emit_dock_changed(app, id, &Default::default());
         return None;
     }
-    let w = app.get_webview_window(ISLAND)?;
-    let r = dock::snap_on_release(&w);
+    let r = dock::snap_on_release(w);
     let monitor = w.current_monitor().ok().flatten().and_then(|m| m.name().cloned());
-    cfg.0.update(|s| {
-        s.dock = match &r {
-            Some(sr) => dock::DockState {
-                edge: sr.edge,
-                offset: sr.offset,
-                monitor,
-            },
-            None => Default::default(),
-        };
-    });
-    let _ = app.emit("dock-changed", cfg.0.get().dock);
+    let dock_state = match &r {
+        Some(sr) => dock::DockState { edge: sr.edge, offset: sr.offset, monitor },
+        None => Default::default(),
+    };
+    store.update(|settings| { island_clones::set_dock(settings, id, dock_state.clone()); });
+    emit_dock_changed(app, id, &dock_state);
     r
 }
 
 /// 解除停靠，回到自由态收缩尺寸
 #[tauri::command]
-fn dock_undock(app: tauri::AppHandle, cfg: State<Cfg>) {
-    if let Some(w) = app.get_webview_window(ISLAND) {
-        dock::undock(&w);
-    }
-    cfg.0.update(|s| s.dock = Default::default());
-    let _ = app.emit("settings-changed", cfg.0.get());
-    let _ = app.emit("dock-changed", cfg.0.get().dock);
+fn dock_undock(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
+    let id = island_id_of(&window)?;
+    dock_undock_for(&app, &window, id.as_deref());
+    Ok(())
+}
+
+fn dock_undock_for(app: &tauri::AppHandle, w: &WebviewWindow, id: Option<&str>) {
+    dock::undock(w);
+    let next = app.state::<Cfg>().0.update(|settings| { island_clones::set_dock(settings, id, Default::default()); });
+    let _ = app.emit("settings-changed", &next);
+    emit_dock_changed(app, id, &Default::default());
 }
 
 /// 区间内的估算费用（§2.4）。本地记录不含账单，界面必须标注「估算」
@@ -1443,12 +1506,14 @@ fn set_island_source(
     Ok(next)
 }
 
+/// `island` 为目标岛（None 为本体）。托盘摘要与主面板默认连接只跟随本体。
 #[tauri::command]
 async fn set_island_connection(
     app: tauri::AppHandle,
     db: State<'_, Db>,
     cfg: State<'_, Cfg>,
     id: Option<String>,
+    island: Option<String>,
 ) -> Result<settings::Settings, String> {
     let selected = match id.as_ref() {
         Some(id) => {
@@ -1458,25 +1523,19 @@ async fn set_island_connection(
             }).await? else {
                 return Err("所选连接不存在".into());
             };
-            Some((id.clone(), c.name, c.platform, c.kind))
+            let source_id = native_sources::monitor_id(id).map(str::to_string).unwrap_or_else(|| format!("local:{}", c.platform));
+            Some(island_clones::SelectedConnection { id: id.clone(), name: c.name, platform: c.platform, kind: c.kind, source_id })
         }
         None => None,
     };
-    let next = cfg.0.try_update(|s| {
-        if let Some((id, name, platform, kind)) = selected.as_ref() {
-            s.island_connection_id = Some(id.clone());
-            s.island_connection_name = Some(name.clone());
-            s.island_platform = platform.clone();
-            s.island_kind = kind.clone();
-            s.island_source_id = Some(native_sources::monitor_id(id).map(str::to_string).unwrap_or_else(||format!("local:{platform}")));
-        } else {
-            s.island_connection_id = None;
-            s.island_connection_name = None;
-        }
-    })?;
+    let mut found = false;
+    let next = cfg.0.try_update(|s| { found = island_clones::apply_connection(s, island.as_deref(), selected.as_ref()); })?;
+    if !found { return Err("目标灵动岛不存在".into()); }
     let _ = app.emit("settings-changed", &next);
-    let _ = app.emit("island-platform-changed", &next.island_platform);
-    refresh_tray_menu(&app);
+    if island.is_none() {
+        let _ = app.emit("island-platform-changed", &next.island_platform);
+        refresh_tray_menu(&app);
+    }
     Ok(next)
 }
 
@@ -1757,14 +1816,10 @@ async fn update_connection(
             let _ = app.emit("refresh-requested", id.clone());
         }
     }
-    // 名称若是灵动岛当前连接，同步快照（与 rename_connection 命令同一套逻辑）
-    let previous = cfg.0.get().island_connection_name;
-    let next = cfg.0.try_update(|s| {
-        if s.island_connection_id.as_deref() == Some(&id) {
-            s.island_connection_name = Some(trimmed_name.clone());
-        }
-    })?;
-    if next.island_connection_name != previous {
+    // 名称若是任一灵动岛的当前连接，同步快照（与 rename_connection 命令同一套逻辑）
+    let mut renamed = false;
+    let next = cfg.0.try_update(|s| { renamed = island_clones::rename_connection(s, &id, &trimmed_name); })?;
+    if renamed {
         let _ = app.emit("settings-changed", &next);
         refresh_tray_menu(&app);
     }
@@ -1926,13 +1981,9 @@ async fn rename_connection(
     with_database(db.0.clone(), move |conn| {
         connections::rename_connection(conn, &rename_id, &rename_name)
     }).await?;
-    let previous = cfg.0.get().island_connection_name;
-    let next = cfg.0.try_update(|s| {
-        if s.island_connection_id.as_deref() == Some(&id) {
-            s.island_connection_name = Some(name.clone());
-        }
-    })?;
-    if next.island_connection_name != previous {
+    let mut renamed = false;
+    let next = cfg.0.try_update(|s| { renamed = island_clones::rename_connection(s, &id, &name); })?;
+    if renamed {
         let _ = app.emit("settings-changed", &next);
         refresh_tray_menu(&app);
     }
@@ -2093,32 +2144,101 @@ fn activate_existing_instance(app: &tauri::AppHandle) {
     }
 }
 
-/// 灵动岛正常由 tauri.conf 创建；若 WebView 被外部关闭或崩溃，托盘仍能按同一配置重建。
-fn ensure_island_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
-    if let Some(window) = app.get_webview_window(ISLAND) {
+/// 本体由 tauri.conf 创建、分身在启动与「开启分身」时创建；WebView 被外部关闭或崩溃后，
+/// 托盘仍能按同一配置重建。`id` 为 None 表示本体。
+fn ensure_island_window_for(app: &tauri::AppHandle, id: Option<&str>) -> Result<WebviewWindow, String> {
+    let label = island_clones::label(id);
+    if let Some(window) = app.get_webview_window(&label) {
         return Ok(window);
     }
     let settings = app.state::<Cfg>().0.get();
-    let window = WebviewWindowBuilder::new(
-        app,
-        ISLAND,
-        WebviewUrl::App("index.html?window=island".into()),
-    )
-    .title("CC Usage")
-    .inner_size(428.0, 124.0)
-    .resizable(false)
-    .decorations(false)
-    .transparent(true)
-    .shadow(false)
-    .always_on_top(settings.always_on_top)
-    .skip_taskbar(true)
-    .visible(false)
-    .center()
-    .build()?;
-    if settings.dock_enabled && settings.dock.edge.is_some() {
-        let _ = dock::restore_dock(&window, &settings.dock);
+    let profile = island_clones::profile(&settings, id).ok_or("灵动岛配置不存在")?;
+    let url = match id {
+        Some(id) => format!("index.html?window=island&clone={id}"),
+        None => "index.html?window=island".to_string(),
+    };
+    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
+        .title("CC Usage")
+        .inner_size(428.0, 124.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(settings.always_on_top)
+        .skip_taskbar(true)
+        .visible(false)
+        .center()
+        .build().map_err(|e| e.to_string())?;
+    if settings.dock_enabled && profile.dock.edge.is_some() {
+        let _ = dock::restore_dock(&window, &profile.dock);
+    } else if let Some((x, y)) = id
+        .and_then(|id| settings.island_clones.iter().find(|clone| clone.id == id))
+        .and_then(|clone| clone.position)
+    {
+        // 分身自由态：先挪到记录的位置，再夹回当前工作区，显示器变化后不会落到屏幕外。
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+        let _ = dock::resize_free(&window, dock::FREE_W, dock::FREE_H);
     }
     Ok(window)
+}
+
+/// 「开启分身」：以来源岛的连接为初始值，新窗口在来源岛右下 24px 以自由态出现。
+fn create_island_clone(app: &tauri::AppHandle, source: Option<&str>) -> Result<(), String> {
+    let store = &app.state::<Cfg>().0;
+    // 先在副本上校验上限与来源，失败不落盘。
+    island_clones::create_clone(&mut store.get(), source)?;
+    let mut created = None;
+    let next = store.try_update(|settings| { created = island_clones::create_clone(settings, source).ok(); })?;
+    let clone = created.ok_or("创建分身失败")?;
+    let window = ensure_island_window_for(app, Some(&clone.id))?;
+    if let Some(origin) = island_window(app, source) {
+        if let (Ok(position), Ok(scale)) = (origin.outer_position(), origin.scale_factor()) {
+            let offset = (24.0 * scale).round() as i32;
+            let _ = window.set_position(PhysicalPosition::new(position.x + offset, position.y + offset));
+            let _ = dock::resize_free(&window, dock::FREE_W, dock::FREE_H);
+        }
+    }
+    remember_clone_position(app, &clone.id, &window);
+    let _ = window.set_always_on_top(next.always_on_top);
+    if next.island_visible {
+        window.show().map_err(|e| e.to_string())?;
+        let _ = window.set_focus();
+    }
+    let _ = app.emit("settings-changed", store.get());
+    let _ = app.emit("menu-state-changed", ());
+    Ok(())
+}
+
+/// 「销毁分身」：销毁右键所在的岛；本体被销毁时第一个分身接任，本体窗口挪到它的位置。
+fn destroy_island(app: &tauri::AppHandle, target: Option<&str>) -> Result<(), String> {
+    let store = &app.state::<Cfg>().0;
+    island_clones::destroy(&mut store.get(), target)?;
+    let mut plan = None;
+    store.try_update(|settings| { plan = island_clones::destroy(settings, target).ok(); })?;
+    match plan.ok_or("销毁分身失败")? {
+        island_clones::DestroyPlan::CloseClone(id) => {
+            // 灵动岛的关闭请求会被拦成隐藏，这里必须直接销毁。
+            if let Some(window) = island_window(app, Some(&id)) { window.destroy().map_err(|e| e.to_string())?; }
+        }
+        island_clones::DestroyPlan::PromoteClone { closed } => {
+            let clone_window = island_window(app, Some(&closed.id));
+            if let Some(primary) = app.get_webview_window(ISLAND) {
+                if let Some(window) = &clone_window {
+                    if let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) {
+                        let _ = primary.set_size(size);
+                        let _ = primary.set_position(position);
+                    }
+                }
+                if closed.dock.edge.is_some() { let _ = dock::restore_dock(&primary, &closed.dock); }
+                emit_dock_changed(app, None, &closed.dock);
+            }
+            if let Some(window) = clone_window { window.destroy().map_err(|e| e.to_string())?; }
+            refresh_tray_menu(app);
+        }
+    }
+    let _ = app.emit("settings-changed", store.get());
+    let _ = app.emit("menu-state-changed", ());
+    Ok(())
 }
 
 /// 主面板首次使用时才创建；关闭只隐藏窗口并保留 WebView，后台采集与灵动岛继续运行。
@@ -2221,6 +2341,13 @@ fn initialize_app(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Result<
             if cfg.island_visible { let _ = w.show(); }
             else { let _ = w.hide(); }
         }
+        // 重建上次运行时开启的分身；各自按保存的停靠或自由态位置落位。
+        for clone in &cfg.island_clones {
+            match ensure_island_window_for(app, Some(&clone.id)) {
+                Ok(w) => { if cfg.island_visible { let _ = w.show(); } }
+                Err(error) => eprintln!("[启动] 重建灵动岛分身 {} 失败: {error}", clone.id),
+            }
+        }
         if first_intro {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -2228,7 +2355,7 @@ fn initialize_app(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Result<
                 if !FIRST_INSTALL_INTRO.swap(false, Ordering::AcqRel) { return; }
                 let settings = app.state::<Cfg>().0.get();
                 if settings.island_visible && settings.dock_enabled && settings.dock.edge.is_none() {
-                    island_position(app, Some(dock::Edge::Top));
+                    island_position(app, Some(dock::Edge::Top), None);
                 }
             });
         }
@@ -2248,7 +2375,7 @@ fn initialize_app(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Result<
                     _ => {}
                 }
                 if matches!(event, TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Up, .. }) {
-                    if let Err(error) = context_menu::open(tray.app_handle(), false) { eprintln!("[菜单] {error}"); }
+                    if let Err(error) = context_menu::open(tray.app_handle(), false, None) { eprintln!("[菜单] {error}"); }
                     return;
                 }
                 if let TrayIconEvent::Click {
@@ -2295,22 +2422,19 @@ fn initialize_app(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Result<
 }
 
 /// 窗口操作成功后再同步设置、前端和托盘，避免显示状态与实际窗口脱节。
-fn set_island_visible(app: &tauri::AppHandle, visible: bool) -> tauri::Result<()> {
+/// 显示 / 隐藏是全局开关：本体与全部分身一起动。
+fn set_island_visible(app: &tauri::AppHandle, visible: bool) -> Result<(), String> {
     if !visible { FIRST_INSTALL_INTRO.store(false, Ordering::Release); }
-    let window = if visible {
-        Some(ensure_island_window(app)?)
+    if visible {
+        for id in island_ids(&app.state::<Cfg>().0.get()) {
+            let w = ensure_island_window_for(app, id.as_deref())?;
+            // show 不会解除 Windows 的最小化状态；灵动岛也没有任务栏恢复入口。
+            w.unminimize().map_err(|e| e.to_string())?;
+            w.show().map_err(|e| e.to_string())?;
+            let _ = w.set_focus();
+        }
     } else {
-        app.get_webview_window(ISLAND)
-    };
-    if let Some(w) = window {
-      if visible {
-        // show 不会解除 Windows 的最小化状态；灵动岛也没有任务栏恢复入口。
-        w.unminimize()?;
-        w.show()?;
-        let _ = w.set_focus();
-      } else {
-        w.hide()?;
-      }
+        for w in island_windows(app) { w.hide().map_err(|e| e.to_string())?; }
     }
     let next = app.state::<Cfg>().0.update(|s| s.island_visible = visible);
     let _ = app.emit("settings-changed", next);
@@ -2325,10 +2449,10 @@ async fn open_main_panel(app: tauri::AppHandle) {
     show_main_with_intent(&app, MainIntent::Overview { settings });
 }
 
-fn toggle_island(app: &tauri::AppHandle) -> tauri::Result<()> {
+fn toggle_island(app: &tauri::AppHandle) -> Result<(), String> {
     // 窗口缺失时视为隐藏并重建；最小化窗口也恢复，避免用户没有任务栏入口。
     let visible = match app.get_webview_window(ISLAND) {
-        Some(window) => !window.is_visible()? || window.is_minimized()?,
+        Some(window) => !window.is_visible().map_err(|e| e.to_string())? || window.is_minimized().map_err(|e| e.to_string())?,
         None => true,
     };
     set_island_visible(app, visible)
@@ -2341,11 +2465,27 @@ fn reset_window_layout(app: &tauri::AppHandle) {
     app.state::<Cfg>().0.update(|settings| settings.main_window = None);
     if let Ok(mut placement) = MAIN_PLACEMENT.lock() { *placement = None; }
     if let Some(w) = app.get_webview_window(ISLAND) {
-        app.state::<Cfg>().0.update(|s| s.dock = Default::default());
-        let _ = app.emit("settings-changed", app.state::<Cfg>().0.get());
-        let _ = app.emit("dock-changed", app.state::<Cfg>().0.get().dock);
+        let next = app.state::<Cfg>().0.update(|s| {
+            s.dock = Default::default();
+            for clone in &mut s.island_clones { clone.dock = Default::default(); clone.position = None; }
+        });
+        let _ = app.emit("settings-changed", &next);
+        for id in island_ids(&next) { emit_dock_changed(app, id.as_deref(), &Default::default()); }
         let _ = w.set_size(tauri::LogicalSize::new(428.0, 124.0));
         let _ = w.center();
+        // 分身解除停靠后从本体位置依次向右下错开 24px，避免叠在一起看不见。
+        let origin = w.outer_position().ok();
+        let scale = w.scale_factor().unwrap_or(1.0);
+        for (index, clone) in next.island_clones.iter().enumerate() {
+            let Some(cw) = island_window(app, Some(&clone.id)) else { continue };
+            let _ = cw.set_size(tauri::LogicalSize::new(428.0, 124.0));
+            if let Some(position) = origin {
+                let offset = ((index as f64 + 1.0) * 24.0 * scale).round() as i32;
+                let _ = cw.set_position(PhysicalPosition::new(position.x + offset, position.y + offset));
+                let _ = dock::resize_free(&cw, dock::FREE_W, dock::FREE_H);
+            }
+            remember_clone_position(app, &clone.id, &cw);
+        }
         if let Err(e) = set_island_visible(app, true) {
             eprintln!("[窗口] 恢复灵动岛失败: {e}");
         }
@@ -2495,27 +2635,30 @@ fn finish_tray_refresh_after_cooldown(app: tauri::AppHandle) {
 
 /// 托盘菜单事件。灵动岛可见性与平台选择都写回持久化设置，
 /// 并通过事件通知前端，保证托盘与设置界面显示同一个值。
-fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
+/// `island` 是右键菜单所属的岛（None 为本体或托盘）；位置与分身操作都作用于它。
+fn handle_tray_menu(app: &tauri::AppHandle, id: &str, island: Option<&str>) -> Result<(), String> {
     match id {
         "open_main" => show_main_with_intent(
             app,
             MainIntent::Overview { settings: app.state::<Cfg>().0.get() },
         ),
         "island_refresh" => {
-            if TRAY_REFRESHING.swap(true, Ordering::Relaxed) { return; }
+            if TRAY_REFRESHING.swap(true, Ordering::Relaxed) { return Ok(()); }
             refresh_tray_menu(app);
             let _ = app.emit("island-refresh", ());
             let _ = app.emit("refresh-requested", ());
             finish_tray_refresh_after_cooldown(app.clone());
         }
         "topmost" => { let _ = island_topmost(app.clone(), !app.state::<Cfg>().0.get().always_on_top); }
-        "pos_free" => island_position(app.clone(), None),
-        "pos_top" => island_position(app.clone(), Some(dock::Edge::Top)),
-        "pos_bottom" => island_position(app.clone(), Some(dock::Edge::Bottom)),
-        "pos_left" => island_position(app.clone(), Some(dock::Edge::Left)),
-        "pos_right" => island_position(app.clone(), Some(dock::Edge::Right)),
+        "pos_free" => island_position(app.clone(), None, island.map(str::to_string)),
+        "pos_top" => island_position(app.clone(), Some(dock::Edge::Top), island.map(str::to_string)),
+        "pos_bottom" => island_position(app.clone(), Some(dock::Edge::Bottom), island.map(str::to_string)),
+        "pos_left" => island_position(app.clone(), Some(dock::Edge::Left), island.map(str::to_string)),
+        "pos_right" => island_position(app.clone(), Some(dock::Edge::Right), island.map(str::to_string)),
+        "clone_create" => create_island_clone(app, island)?,
+        "clone_destroy" => destroy_island(app, island)?,
         "refresh" => {
-            if TRAY_REFRESHING.swap(true, Ordering::Relaxed) { return; }
+            if TRAY_REFRESHING.swap(true, Ordering::Relaxed) { return Ok(()); }
             refresh_tray_menu(app);
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -2563,6 +2706,7 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
             }
         }
     }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2702,7 +2846,7 @@ pub fn run() {
                     }
                 }
             }
-            if window.label() == ISLAND {
+            if island_clones::is_island_label(window.label()) {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     // 无边框灵动岛没有用户可点的关闭入口；系统关闭请求多见于应用退出或开发热重载。
@@ -2713,33 +2857,35 @@ pub fn run() {
                     return;
                 }
             }
-            if window.label() == ISLAND
+            if island_clones::is_island_label(window.label())
                 && matches!(event, WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. })
             {
-                // Windows 回调中不能同步等待窗口查询；交给后台线程并合并密集移动事件。
-                static PENDING: AtomicBool = AtomicBool::new(false);
-                if !PENDING.swap(true, Ordering::Relaxed) {
+                // Windows 回调中不能同步等待窗口查询；交给后台线程并按窗口合并密集移动事件。
+                static PENDING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+                let label = window.label().to_string();
+                let queued = PENDING.lock().map(|mut set| set.insert(label.clone())).unwrap_or(false);
+                if queued {
                     let app = window.app_handle().clone();
                     let scale_changed = matches!(event, WindowEvent::ScaleFactorChanged { .. });
                     tauri::async_runtime::spawn_blocking(move || {
-                        if let Some(webview) = app.get_webview_window(ISLAND) {
-                            let Some(store) = app.try_state::<Cfg>() else {
-                                PENDING.store(false, Ordering::Relaxed);
-                                return;
-                            };
+                        if let (Some(webview), Some(store)) = (app.get_webview_window(&label), app.try_state::<Cfg>()) {
+                            let id = island_clones::id_from_label(&label).flatten();
                             let cfg = store.0.get();
+                            let dock_state = island_dock(&cfg, id.as_deref());
                             if dock::DRAGGING.load(Ordering::Relaxed) {
                                 let hint = if cfg.dock_enabled { dock::hover_hint(&webview) } else { None };
-                                let _ = webview.emit("dock-hint", hint);
-                            } else if cfg.dock.edge.is_some()
-                                && (scale_changed || !dock::monitor_exists(&webview, cfg.dock.monitor.as_deref())) {
-                                if let Some(monitor) = dock::restore_dock(&webview, &cfg.dock) {
-                                    let next = app.state::<Cfg>().0.update(|settings| settings.dock.monitor = Some(monitor));
+                                let _ = app.emit("dock-hint", DockHintEvent { island: id.clone(), hint });
+                            } else if dock_state.edge.is_some()
+                                && (scale_changed || !dock::monitor_exists(&webview, dock_state.monitor.as_deref())) {
+                                if let Some(monitor) = dock::restore_dock(&webview, &dock_state) {
+                                    let next = store.0.update(|settings| {
+                                        island_clones::set_dock(settings, id.as_deref(), dock::DockState { monitor: Some(monitor), ..dock_state.clone() });
+                                    });
                                     let _ = app.emit("settings-changed", next);
                                 }
                             }
                         }
-                        PENDING.store(false, Ordering::Relaxed);
+                        if let Ok(mut set) = PENDING.lock() { set.remove(&label); }
                     });
                 }
             }

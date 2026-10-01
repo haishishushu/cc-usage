@@ -56,6 +56,9 @@ pub struct Settings {
     /// 停靠状态：边缘与沿边偏移，重启后恢复（§2.1.3）
     #[serde(default)]
     pub dock: crate::dock::DockState,
+    /// 灵动岛分身列表（画布 22）。本体仍用上面的 island_* 与 dock 字段，分身各自一条。
+    #[serde(default)]
+    pub island_clones: Vec<crate::island_clones::IslandClone>,
     /// 主面板上次的位置与尺寸；旧版设置缺少此字段时首次打开仍居中。
     #[serde(default)]
     pub main_window: Option<crate::main_window::Placement>,
@@ -120,6 +123,7 @@ impl Default for Settings {
             dnd: false,
             island_visible: true,
             dock: Default::default(),
+            island_clones: Vec::new(),
             main_window: None,
             proxy_enabled: false,
             proxy_port: default_proxy_port(),
