@@ -21,7 +21,7 @@ import { authQuotaRows } from "@/lib/authQuotaRows"
 import { isPlanCovered, planCoverageHint } from "@/lib/planCoverage.ts"
 import type { QueryState } from "@/components/panel/QueryStateNotice"
 import { BALANCE, CLAUDE_QUOTAS } from "@/mock/data"
-import { useModels, useRequestLog, useTokenSummaries, useTrend, useUsageBreakdown } from "@/lib/useUsage"
+import { useModels, useRequestLog, useTokenSummaries, useTrend, useUsageBreakdown, useAttributedCount } from "@/lib/useUsage"
 import { shortModelName } from "@/lib/modelName"
 import type { PlatformId, StatPeriod } from "@/types"
 import { platformConfig, isFetchOnlyPlatform, platformSupports } from "@/lib/platforms"
@@ -136,6 +136,8 @@ export function OverviewView({
   const [custom, setCustom] = useState<CustomRange | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null)
+  // 「仅此连接」范围：只统计经本地代理归账到当前连接的记录；没有归账记录时不提供该选项
+  const [scopeToConnection, setScopeToConnection] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [quotaNow, setQuotaNow] = useState(() => Date.now())
   const collection = useCollectionStatus()
@@ -193,21 +195,25 @@ export function OverviewView({
     () => Date.now(),
     [platform, period, custom?.start, custom?.end, refreshKey, model],
   )
-  const fetchedCost = useCostEstimate(platform, period, custom, queryEndMs, model)
+  const attributedCount = useAttributedCount(active?.id ?? null, refreshKey)
+  const statsConnection = scopeToConnection && attributedCount > 0 && active ? active.id : null
+  const fetchedCost = useCostEstimate(platform, period, custom, queryEndMs, model, true, statsConnection)
   const cost = platformSupports(platform, "cost_estimate") ? fetchedCost : null
   const platformName = platformConfig(platform).name
 
   // 真实数据；浏览器预览下回落到设计示例
-  const { summaries, status: summaryStatus, error: summaryError } = useTokenSummaries(platform, custom, refreshKey, queryEndMs, model)
-  const { breakdown, status: breakdownStatus, error: breakdownError } = useUsageBreakdown(platform, period, custom, refreshKey, queryEndMs, model)
-  const { chart, status: trendStatus, error: trendError } = useTrend(platform, period, custom, refreshKey, queryEndMs, model)
-  const { rows: logRows, totalCount, pageCount, status: logStatus, error: logError } = useRequestLog(platform, period, page, custom, refreshKey, queryEndMs, model)
-  const models = useModels(platform, period, custom, refreshKey, queryEndMs)
-  const trendMotion = useContentMotion(`${platform}:${period}:${custom?.start}:${custom?.end}:${model}`, 120, 0)
-  const logMotion = useContentMotion(`${platform}:${period}:${page}:${custom?.start}:${custom?.end}:${model}`, 120, 0)
+  const { summaries, status: summaryStatus, error: summaryError } = useTokenSummaries(platform, custom, refreshKey, queryEndMs, model, statsConnection)
+  const { breakdown, status: breakdownStatus, error: breakdownError } = useUsageBreakdown(platform, period, custom, refreshKey, queryEndMs, model, statsConnection)
+  const { chart, status: trendStatus, error: trendError } = useTrend(platform, period, custom, refreshKey, queryEndMs, model, statsConnection)
+  const { rows: logRows, totalCount, pageCount, status: logStatus, error: logError } = useRequestLog(platform, period, page, custom, refreshKey, queryEndMs, model, statsConnection)
+  const models = useModels(platform, period, custom, refreshKey, queryEndMs, statsConnection)
+  const trendMotion = useContentMotion(`${platform}:${period}:${custom?.start}:${custom?.end}:${model}:${statsConnection}`, 120, 0)
+  const logMotion = useContentMotion(`${platform}:${period}:${page}:${custom?.start}:${custom?.end}:${model}:${statsConnection}`, 120, 0)
 
-  // 切换平台、周期或模型后回到第一页（§2.4）；自定义范围变化同理
-  useEffect(() => setPage(1), [platform, period, custom, model])
+  // 切换平台、周期、模型或统计范围后回到第一页（§2.4）；自定义范围变化同理
+  useEffect(() => setPage(1), [platform, period, custom, model, statsConnection])
+  // 换平台后范围回到全部本机记录
+  useEffect(() => setScopeToConnection(false), [platform])
 
   // 换平台后旧平台的模型名不再适用，留着会筛出空结果
   useEffect(() => setModel(null), [platform])
@@ -326,6 +332,20 @@ export function OverviewView({
           </Button>
         )}
       </div>
+      {active && attributedCount > 0 && (
+        <div className="flex w-full items-center gap-3">
+          <span className="text-xs text-text-secondary">本机统计范围：</span>
+          <Segmented
+            value={scopeToConnection ? "connection" : "all"}
+            onChange={(value) => setScopeToConnection(value === "connection")}
+            items={[
+              { value: "all", label: "全部本机记录" },
+              { value: "connection", label: `仅此连接 · ${attributedCount.toLocaleString("en-US")} 条` },
+            ]}
+          />
+          <span className="text-[11px] text-text-tertiary">「仅此连接」只含经本地代理按凭证归账到该连接的请求</span>
+        </div>
+      )}
 
       <div ref={connectionMotion}>
       {platform === "grok" && effectiveVariant === "auth" ? (
@@ -397,7 +417,7 @@ export function OverviewView({
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-semibold text-text-primary">今日 API 用量</h3>
             <span className="text-[11px] text-text-tertiary">
-              {officialApiUsage.state?.state === "ok" ? officialApiUsage.state.source : "本机同平台会话记录"}
+              {officialApiUsage.state?.state === "ok" ? officialApiUsage.state.source : statsConnection ? "该连接经代理归账的记录" : "本机同平台会话记录"}
             </span>
           </div>
           <div className="flex gap-4">
@@ -406,7 +426,7 @@ export function OverviewView({
               value={officialApiUsage.state?.state === "ok"
                 ? grouped(officialApiUsage.state.total_tokens)
                 : summaries.find((item) => item.period === "today")?.value ?? "—"}
-              hint={officialApiUsage.state?.state === "ok" ? "官方组织聚合" : "本机记录，无法按 Key 区分"}
+              hint={officialApiUsage.state?.state === "ok" ? "官方组织聚合" : statsConnection ? "仅此连接经代理归账的记录" : "本机记录，无法按 Key 区分"}
             />
             <TokenCard
               label="今日费用"
@@ -553,7 +573,10 @@ export function OverviewView({
           </p>
         )}
         <Hint>
-          当前统计来自本平台本机会话记录，无法按具体账号或 API Key 区分；「真实消耗」含缓存重读（每次请求都会重复计入上下文），
+          {statsConnection
+            ? "当前统计只含经本地代理按凭证归账到该连接的请求；未经代理或 OAuth 令牌的记录不在其中。"
+            : "当前统计来自本平台本机会话记录，无法按具体账号或 API Key 区分；"}
+          「真实消耗」含缓存重读（每次请求都会重复计入上下文），
           因此大于灵动岛实时数——灵动岛与 Claude Code 终端一致，只计新鲜 Token（输入+输出）。
           「新增输入」已扣除缓存重读，是与灵动岛口径一致的那部分。
           「缓存创建」与「缓存命中」按会话记录中的对应字段统计。Codex Auth 的缓存创建零值无法证明实际创建量为零，显示「—」；

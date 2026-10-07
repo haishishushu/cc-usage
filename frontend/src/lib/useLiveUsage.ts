@@ -150,10 +150,11 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
         animate()
       }
       // 失败会话由后端保证只在 90 秒窗口内出现，这里放行展示「失败」标签。
+      // Zcode 的本机库给每条请求带状态：最近活跃窗口内的会话按完成 / 失败 / 运行中真实标注。
       const visibleSessions = u.active_sessions.filter((session) =>
         (platform === "codex" || platform === "claude")
           ? session.state === "running" || session.state === "failed"
-          : session.state === "recent",
+          : platform === "zcode" ? true : session.state === "recent",
       )
       if (!dnd) {
         for (const session of visibleSessions) {
@@ -228,9 +229,11 @@ export function useLiveUsage(platform: string, enabled = true, dnd = false, paus
     // 「运行中」只数 running 会话；失败会话单独提示，不混入运行数。
     activityCountText: (() => {
       if (sessions.length === 0) return null
-      if (platform !== "codex" && platform !== "claude") return `${sessions.length} 个最近活跃会话`
       const running = sessions.filter((session) => session.state === "running").length
       const failed = sessions.filter((session) => session.state === "failed").length
+      // Zcode 有真实状态：有运行 / 失败时按状态计数，否则仍是「最近活跃」
+      if (platform === "zcode" && running === 0 && failed === 0) return `${sessions.length} 个最近活跃会话`
+      if (platform !== "codex" && platform !== "claude" && platform !== "zcode") return `${sessions.length} 个最近活跃会话`
       if (running === 0 && failed === 0) return null
       if (running === 0) return `${failed} 个会话失败`
       return failed > 0 ? `${running} 个会话运行中 · ${failed} 个失败` : `${running} 个会话运行中`

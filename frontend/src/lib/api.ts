@@ -89,6 +89,10 @@ export interface SourceMetrics {
   credit_requests: number
   context_ratio: number | null
   context_at_ms: number | null
+  /** 区间思考 / 推理 Token 合计；来源不提供时为 null */
+  reasoning: number | null
+  /** 区间工具调用提示 Token 合计（Gemini tokens.tool）；来源不提供时为 null */
+  tool: number | null
 }
 
 export interface ApiLogRow {
@@ -483,24 +487,27 @@ export const api = {
   /** 安装已下载的安装包；Windows 上安装器接管并自动重启 */
   installDownloadedUpdate: () => invoke<void>("install_downloaded_update_and_restart"),
   setSilentStartup: (on: boolean) => invoke<AppSettings>("set_silent_startup", { on }),
-  tokenTotals: (platform: string, custom: CustomRange | null, model: string | null, queryEndMs: number) =>
-    invoke<PeriodTotals>("token_totals", { platform, custom, model, queryEndMs }),
+  /** connection 非空时只统计经本地代理归账到该连接的记录；null 为全部本机记录 */
+  tokenTotals: (platform: string, custom: CustomRange | null, model: string | null, queryEndMs: number, connection: string | null = null) =>
+    invoke<PeriodTotals>("token_totals", { platform, custom, model, queryEndMs, connection }),
   usageBreakdown: (
     platform: string,
     period: string,
     custom: CustomRange | null,
     model: string | null,
     queryEndMs: number,
-  ) => invoke<UsageBreakdown>("usage_breakdown", { platform, period, custom, model, queryEndMs }),
-  listModels: (platform: string, period: string, custom: CustomRange | null, queryEndMs: number) =>
-    invoke<string[]>("list_models", { platform, period, custom, queryEndMs }),
+    connection: string | null = null,
+  ) => invoke<UsageBreakdown>("usage_breakdown", { platform, period, custom, model, queryEndMs, connection }),
+  listModels: (platform: string, period: string, custom: CustomRange | null, queryEndMs: number, connection: string | null = null) =>
+    invoke<string[]>("list_models", { platform, period, custom, queryEndMs, connection }),
   usageTrend: (
     platform: string,
     period: string,
     custom: CustomRange | null,
     model: string | null,
     queryEndMs: number,
-  ) => invoke<Trend>("usage_trend", { platform, period, custom, model, queryEndMs }),
+    connection: string | null = null,
+  ) => invoke<Trend>("usage_trend", { platform, period, custom, model, queryEndMs, connection }),
   requestLog: (
     platform: string,
     period: string,
@@ -508,7 +515,10 @@ export const api = {
     custom: CustomRange | null,
     model: string | null,
     queryEndMs: number,
-  ) => invoke<LogPage>("request_log", { platform, period, page, custom, model, queryEndMs }),
+    connection: string | null = null,
+  ) => invoke<LogPage>("request_log", { platform, period, page, custom, model, queryEndMs, connection }),
+  /** 经本地代理归账到该连接的请求数；为 0 时不提供「仅此连接」范围 */
+  connectionAttributedCount: (id: string) => invoke<number>("connection_attributed_count", { id }),
   connectionQuota: (id: string, force: Freshness = false) => invoke<QuotaStateDto>("connection_quota", { id, ...freshnessArgs(force) }),
   connectionApiUsage: (id: string, force: Freshness = false) => invoke<ApiUsageStateDto>("connection_api_usage", { id, ...freshnessArgs(force) }),
   connectionBalance: (id: string, force: Freshness = false) => invoke<BalanceStateDto>("connection_balance", { id, ...freshnessArgs(force) }),
@@ -518,7 +528,8 @@ export const api = {
     custom: CustomRange | null,
     model: string | null,
     queryEndMs: number,
-  ) => invoke<CostEstimateDto>("cost_estimate", { platform, period, custom, model, queryEndMs }),
+    connection: string | null = null,
+  ) => invoke<CostEstimateDto>("cost_estimate", { platform, period, custom, model, queryEndMs, connection }),
   dockHover: () => invoke<DockEdgeDto | null>("dock_hover"),
   dockRelease: () => invoke<SnapResult | null>("dock_release"),
   dockUndock: () => invoke<void>("dock_undock"),

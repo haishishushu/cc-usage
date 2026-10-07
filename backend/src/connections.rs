@@ -644,6 +644,13 @@ pub(crate) fn creds_of(conn: &Sql, id: &str) -> rusqlite::Result<Option<Creds>> 
     .optional()
 }
 
+/// 本地代理按凭证归账用：API Key 连接的 (id, platform, secret)。只在内存里做哈希比对，不返回给前端。
+pub(crate) fn api_key_secrets(conn: &Sql) -> rusqlite::Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, platform, secret FROM connections WHERE kind = 'api' AND secret IS NOT NULL AND secret != ''")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// 所有远程查询在命中缓存或发送请求之前，都必须经过此检查。
 pub(crate) fn query_creds(conn: &Sql, id: &str) -> Result<Option<Creds>, String> {
     let current = creds_of(conn, id).map_err(|e| e.to_string())?;

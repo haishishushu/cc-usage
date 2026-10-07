@@ -127,3 +127,10 @@
 - Gemini CLI：Context7 `/google-gemini/gemini-cli`，官方 `packages/core/src/services/chatRecordingTypes.ts`、`chatRecordingService.ts` 与 `docs/cli/session-management.md`。其他平台的接口依据需在对应适配实施前继续核实。
 
 状态：鼠鼠已回复“写吧”，设计已获确认，进入实施计划编写阶段。实施计划审阅与执行方式选择完成后进入产品代码实现。
+
+## 2026-10-01 现状更新
+
+- Gemini：本机 CLI 留存会话（`~/.gemini/tmp`，checkpoint / rewind 重建）、`tokens.input/output/cached/thoughts/tool` 已解析；官方 API Key 只读检测可用；在线订阅额度无已验证接口，保持 `unsupported`。
+- Zcode：本机 SQLite `model_usage` 已接入，含输入口径判定、`native_outcome` 与会话标题；会话状态按请求 `status` 标注完成 / 失败 / 运行中（运行中含 10 分钟宽限）；BigModel Coding Plan Key 套餐可查，账号 OAuth 额度未接入。
+- Workbuddy：JSONL `providerData` 与 `workbuddy.db` 标题 / 上下文占用已接入；在线个人剩余积分需开放平台授权，未接入。
+- 各原生平台的请求状态码、耗时、首字仍只有代理链路提供；缓存创建等字段按来源是否提供保留未知。

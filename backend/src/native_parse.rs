@@ -42,6 +42,7 @@ fn base(platform: &str, source: &str, session: &str, id: &str, ts: i64) -> Recor
         billable: None,
         context_ratio: None,
         reasoning: None,
+        tool: None,
     }
 }
 
@@ -170,6 +171,8 @@ pub fn gemini_message(v: &Value, source: &str, session: &str) -> Option<Record> 
     item.request.cache_read_tokens = num(u, "cached");
     item.request.total_tokens = num(u, "total");
     item.reasoning = num(u, "thoughts");
+    // 官方字段：工具调用提示 Token 已计入 total，不再加到输入 / 输出里。
+    item.tool = num(u, "tool");
     Some(item)
 }
 
@@ -264,7 +267,7 @@ mod tests {
     }
     #[test]
     fn gemini_updates_rewind_and_total_do_not_double_count() {
-        let mut m = json!({"type":"gemini","id":"m","timestamp":1000,"tokens":{"input":1000,"output":20,"cached":800,"thoughts":10,"total":1030}});
+        let mut m = json!({"type":"gemini","id":"m","timestamp":1000,"tokens":{"input":1000,"output":20,"cached":800,"thoughts":10,"tool":7,"total":1037}});
         let mut lines = vec![json!({"sessionId":"s"}), m.clone()];
         m["tokens"]["total"] = json!(1040);
         lines.push(m);
@@ -272,6 +275,7 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].request.total_tokens, Some(1040));
         assert_eq!(r[0].request.cache_write_tokens, None);
+        assert_eq!((r[0].reasoning, r[0].tool), (Some(10), Some(7)), "thoughts / tool 分别落到推理与工具字段");
         lines.push(json!({"$rewindTo":"m"}));
         assert!(gemini_records(&lines, "native:gemini:cli").is_empty());
     }

@@ -258,7 +258,7 @@ fn merged_period_totals_match_per_period_queries() {
         rec("codex", "other-platform", now - 1_000, Some("m1"), Some(7), Some(3), Some(0), Some(0), Some(10)),
     ]);
     let per_period = |platform: &str, model: Option<&str>| -> [Option<i64>; 4] {
-        let filter = Filter::new(platform, model, 3);
+        let filter = Filter::new(platform, model, None, 3);
         let empty = if crate::platforms::native(platform) { "NULL" } else { "0" };
         let sql = format!(
             "SELECT CASE WHEN COUNT(*) = 0 THEN {empty} WHEN MIN(total_known) = 1 THEN SUM(total_tokens) ELSE NULL END

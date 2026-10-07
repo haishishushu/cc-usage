@@ -245,6 +245,9 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     if conn.execute("ALTER TABLE sessions ADD COLUMN turn_started_ms INTEGER", []).is_ok() {
         conn.execute("UPDATE scan_state SET parser_initialized = 0", [])?;
     }
+    // 本地代理按凭证指纹把请求归到具体连接；未经代理的记录保持 NULL，统计默认仍按平台合并。
+    let _ = conn.execute("ALTER TABLE requests ADD COLUMN connection_id TEXT", []);
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_requests_connection ON requests(connection_id, ts);")?;
     Ok(())
 }
 
@@ -280,12 +283,19 @@ struct BackupMetric {
     #[serde(default)] native_outcome: Option<String>,
     credits: Option<f64>, original_credits: Option<f64>, billable: Option<bool>,
     context_ratio: Option<f64>, reasoning: Option<i64>,
+    #[serde(default)] tool: Option<i64>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupAttribution { source: String, dedup_key: String, connection_id: String }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BackupFile {
     #[serde(default)]
     metrics: Vec<BackupMetric>,
+    /// 经本地代理归账到连接的记录；旧备份没有该段，导入时保持无归属。
+    #[serde(default)]
+    attributions: Vec<BackupAttribution>,
     #[serde(default)]
     contexts: Vec<crate::source_store::ContextSnapshot>,
     schema_version: u32,
@@ -525,12 +535,19 @@ pub fn apply_proxy_timing(
     first_token_ms: i64,
     duration_ms: i64,
     status_code: i64,
+    connection_id: Option<&str>,
 ) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE requests SET duration_ms = ?3, first_token_ms = ?4, status_code = ?5
+        "UPDATE requests SET duration_ms = ?3, first_token_ms = ?4, status_code = ?5,
+                connection_id = COALESCE(?6, connection_id)
          WHERE source = ?1 AND dedup_key = ?2",
-        params![crate::collector::SOURCE_LOCAL, dedup_key, duration_ms, first_token_ms, status_code],
+        params![crate::collector::SOURCE_LOCAL, dedup_key, duration_ms, first_token_ms, status_code, connection_id],
     )
+}
+
+/// 经本地代理归账到某条连接的请求数；为 0 时界面不提供「仅此连接」统计范围。
+pub fn attributed_request_count(conn: &Connection, connection_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM requests WHERE connection_id = ?1", [connection_id], |r| r.get(0))
 }
 
 pub fn cleanup_preview(conn: &Connection, cutoff_ms: i64) -> rusqlite::Result<CleanupPreview> {
@@ -636,13 +653,19 @@ pub fn export_backup(conn: &Connection, platform: Option<&str>) -> Result<String
     })).map_err(|error| error.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(|error| error.to_string())?;
 
-    let mut stmt=conn.prepare("SELECT r.source,r.dedup_key,r.input_semantics,m.credits,m.original_credits,m.billable,m.context_ratio,m.reasoning,r.native_outcome
+    let mut stmt=conn.prepare("SELECT r.source,r.dedup_key,r.input_semantics,m.credits,m.original_credits,m.billable,m.context_ratio,m.reasoning,r.native_outcome,m.tool
         FROM requests r LEFT JOIN request_metrics m ON m.request_id=r.id WHERE ?1 IS NULL OR r.platform=?1").map_err(|e|e.to_string())?;
     let metrics=stmt.query_map(params![platform],|r|Ok(BackupMetric { source:r.get(0)?,dedup_key:r.get(1)?,input_semantics:r.get(2)?,
-        credits:r.get(3)?,original_credits:r.get(4)?,billable:r.get(5)?,context_ratio:r.get(6)?,reasoning:r.get(7)?,native_outcome:r.get(8)? }))
+        credits:r.get(3)?,original_credits:r.get(4)?,billable:r.get(5)?,context_ratio:r.get(6)?,reasoning:r.get(7)?,native_outcome:r.get(8)?,tool:r.get(9)? }))
         .map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    let mut attribution_stmt = conn.prepare("SELECT source, dedup_key, connection_id FROM requests
+        WHERE connection_id IS NOT NULL AND (?1 IS NULL OR platform = ?1)").map_err(|e| e.to_string())?;
+    let attributions = attribution_stmt.query_map(params![platform], |r| Ok(BackupAttribution {
+        source: r.get(0)?, dedup_key: r.get(1)?, connection_id: r.get(2)?,
+    })).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&BackupFile {
         metrics,
+        attributions,
         contexts: crate::source_store::contexts(conn,platform).map_err(|e|e.to_string())?,
         schema_version: 2,
         exported_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -694,7 +717,7 @@ pub fn import_backup(conn: &mut Connection, json: &str) -> Result<ImportSummary,
         if !matches!(m.input_semantics.as_str(),"includes_cache"|"excludes_cache"|"unknown")
             || [m.credits,m.original_credits,m.context_ratio].into_iter().flatten().any(|n| !n.is_finite() || n<0.0)
             || m.native_outcome.as_deref().is_some_and(|s|!matches!(s,"success"|"failed"|"unknown"))
-            || m.context_ratio.is_some_and(|n|n>1.0) || m.reasoning.is_some_and(|n|n<0)
+            || m.context_ratio.is_some_and(|n|n>1.0) || m.reasoning.is_some_and(|n|n<0) || m.tool.is_some_and(|n|n<0)
             || metrics.insert((m.source.as_str(),m.dedup_key.as_str()),m).is_some() {
             return Err("备份包含无效或重复的来源指标".into());
         }
@@ -708,7 +731,7 @@ pub fn import_backup(conn: &mut Connection, json: &str) -> Result<ImportSummary,
             };
             requests_changed+=crate::source_store::write(&tx,&[crate::source_store::Record { request:r.clone(),input_semantics,
                 credits:m.and_then(|m|m.credits),original_credits:m.and_then(|m|m.original_credits),billable:m.and_then(|m|m.billable),
-                context_ratio:m.and_then(|m|m.context_ratio),reasoning:m.and_then(|m|m.reasoning) }]).map_err(|e|e.to_string())?;
+                context_ratio:m.and_then(|m|m.context_ratio),reasoning:m.and_then(|m|m.reasoning),tool:m.and_then(|m|m.tool) }]).map_err(|e|e.to_string())?;
             if let Some(m)=m {tx.execute("UPDATE requests SET native_outcome=?1 WHERE source=?2 AND dedup_key=?3",params![m.native_outcome,r.source,r.dedup_key]).map_err(|e|e.to_string())?;}
         } else {requests_changed+=insert_records_into(&tx,std::slice::from_ref(r)).map_err(|e|e.to_string())?;}
     }
@@ -716,6 +739,13 @@ pub fn import_backup(conn: &mut Connection, json: &str) -> Result<ImportSummary,
         if !crate::platforms::known(&c.platform) || c.source.len()>512 || c.session_id.len()>1024 || c.ts<=0
             || !c.ratio.is_finite() || !(0.0..=1.0).contains(&c.ratio) {return Err("备份包含无效上下文快照".into());}
         crate::source_store::context(&tx,&c).map_err(|e|e.to_string())?;
+    }
+    for a in &backup.attributions {
+        if a.source.len() > 512 || a.dedup_key.len() > 1_024 || a.connection_id.trim().is_empty() || a.connection_id.len() > 128 {
+            return Err("备份包含无效的连接归属".into());
+        }
+        tx.execute("UPDATE requests SET connection_id = ?1 WHERE source = ?2 AND dedup_key = ?3",
+            params![a.connection_id, a.source, a.dedup_key]).map_err(|e| e.to_string())?;
     }
     let mut sessions_changed = 0;
     for session in backup.sessions {
@@ -906,12 +936,19 @@ pub fn live_usage(
         (" AND r.platform = ?2".to_string(), vec![platform.to_string()])
     };
 
+    // Zcode 的本机库给每条请求带状态，会话状态可信；其他原生来源仍只有「最近活跃」。
+    let typed_states = platform == "zcode";
     let read_sessions = |sql: &str, a: i64| -> rusqlite::Result<Vec<ActiveSession>> {
         let mut stmt = conn.prepare(sql)?;
         let map = |r: &rusqlite::Row| -> rusqlite::Result<ActiveSession> {
             let sid: Option<String> = r.get(0)?;
             let sid = sid.unwrap_or_default();
             let title: Option<String> = r.get(1)?;
+            let activity: Option<String> = r.get(4)?;
+            let state = match activity.as_deref() {
+                Some(s @ ("running" | "done" | "failed")) if typed_states => s,
+                _ => "recent",
+            };
             Ok(ActiveSession {
                 title: title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
                     "未命名会话".to_string()
@@ -921,7 +958,7 @@ pub fn live_usage(
                 last_seen_ms: r.get(3)?,
                 started_at_ms: None,
                 running_tokens: None,
-                state: "recent".into(),
+                state: state.into(),
             })
         };
         let rows = if extra.is_empty() {
@@ -934,7 +971,7 @@ pub fn live_usage(
 
     let group_sql = |cond: &str| {
         format!(
-            "SELECT r.session_id, s.title, SUM(r.total_tokens), MAX(r.ts)
+            "SELECT r.session_id, s.title, SUM(r.total_tokens), MAX(r.ts), s.activity_state
              FROM requests r
              LEFT JOIN sessions s
                ON s.platform = r.platform AND s.session_id = r.session_id
@@ -1148,12 +1185,17 @@ struct Filter {
 
 impl Filter {
     /// `first` 是第一个可选参数的占位序号；它前面的序号留给各查询自己的固定参数。
-    fn new(platform: &str, model: Option<&str>, first: usize) -> Self {
+    /// `connection` 只筛经本地代理归账到该连接的记录；None 为全部本机记录。
+    fn new(platform: &str, model: Option<&str>, connection: Option<&str>, first: usize) -> Self {
         let mut clause = String::new();
         let mut args = Vec::new();
         if platform != "all" {
             clause.push_str(&format!(" AND platform = ?{}", first + args.len()));
             args.push(rusqlite::types::Value::Text(platform.to_string()));
+        }
+        if let Some(id) = connection {
+            clause.push_str(&format!(" AND connection_id = ?{}", first + args.len()));
+            args.push(rusqlite::types::Value::Text(id.to_string()));
         }
         // 模型名允许为空字符串（来源没给模型时记录为 NULL），"all" 作为「不筛选」的哨兵；
         // 真有模型叫 all 也不会误伤——前端传的是 None 而非字符串 "all"。
@@ -1174,6 +1216,8 @@ impl Filter {
 
 /// 区间内出现过的模型名，供筛选下拉使用。NULL（来源未提供模型）不进列表——
 /// 它不是一个可供选择的模型，而是「这条记录没说」。
+/// 测试沿用的旧签名：不按连接筛选。
+#[cfg(test)]
 pub fn list_models_at(
     conn: &Connection,
     platform: &str,
@@ -1181,8 +1225,19 @@ pub fn list_models_at(
     custom: Option<CustomRange>,
     query_end_ms: i64,
 ) -> rusqlite::Result<Vec<String>> {
+    list_models_at_scoped(conn, platform, period, custom, None, query_end_ms)
+}
+
+pub fn list_models_at_scoped(
+    conn: &Connection,
+    platform: &str,
+    period: &str,
+    custom: Option<CustomRange>,
+    connection: Option<&str>,
+    query_end_ms: i64,
+) -> rusqlite::Result<Vec<String>> {
     let (start, end) = resolve_range_at(conn, platform, period, custom, query_end_ms);
-    let filter = Filter::new(platform, None, 3);
+    let filter = Filter::new(platform, None, connection, 3);
     let sql = format!(
         "SELECT DISTINCT model FROM requests
          WHERE ts >= ?1 AND ts < ?2 AND model IS NOT NULL AND model <> ''{}
@@ -1208,6 +1263,8 @@ pub struct PeriodTotals {
     pub collected_since: Option<String>,
 }
 
+/// 测试沿用的旧签名：不按连接筛选。
+#[cfg(test)]
 pub fn token_totals_at(
     conn: &Connection,
     platform: &str,
@@ -1215,8 +1272,19 @@ pub fn token_totals_at(
     model: Option<&str>,
     query_end_ms: i64,
 ) -> rusqlite::Result<PeriodTotals> {
+    token_totals_at_scoped(conn, platform, custom, model, None, query_end_ms)
+}
+
+pub fn token_totals_at_scoped(
+    conn: &Connection,
+    platform: &str,
+    custom: Option<CustomRange>,
+    model: Option<&str>,
+    connection: Option<&str>,
+    query_end_ms: i64,
+) -> rusqlite::Result<PeriodTotals> {
     let sum_range = |start: i64, end: i64| -> rusqlite::Result<Option<i64>> {
-        let filter = Filter::new(platform, model, 3);
+        let filter = Filter::new(platform, model, connection, 3);
         let sql = format!(
             "SELECT CASE WHEN COUNT(*) = 0 THEN {empty}
                          WHEN MIN(total_known) = 1 THEN SUM(total_tokens)
@@ -1237,7 +1305,7 @@ pub fn token_totals_at(
                 THEN SUM(CASE WHEN ts >= ?{slot} THEN total_tokens END)
               ELSE NULL END"
     );
-    let filter = Filter::new(platform, model, 5);
+    let filter = Filter::new(platform, model, connection, 5);
     let sql = format!(
         "SELECT {}, {}, {},
                 CASE WHEN COUNT(*) = 0 THEN {empty} WHEN MIN(total_known) = 1 THEN SUM(total_tokens) ELSE NULL END
@@ -1260,7 +1328,7 @@ pub fn token_totals_at(
     };
     // 采集起点跟随当前筛选：筛了模型就显示该模型最早的记录时间，
     // 否则「累计 X（采集起点 Y）」里的两个数会来自不同范围，自相矛盾。
-    let since_filter = Filter::new(platform, model, 1);
+    let since_filter = Filter::new(platform, model, connection, 1);
     let since_sql = format!(
         "SELECT MIN(ts) FROM requests WHERE 1 = 1{}",
         since_filter.clause
@@ -1333,6 +1401,8 @@ const EXCLUDE_DEGENERATE_SQL: &str = " AND NOT (platform = 'claude' AND input_kn
      AND output_known = 1 AND output_tokens = 0 \
      AND (cache_read_known = 0 OR cache_write_known = 0))";
 
+/// 测试沿用的旧签名：不按连接筛选。
+#[cfg(test)]
 pub fn usage_breakdown_at(
     conn: &Connection,
     platform: &str,
@@ -1341,8 +1411,20 @@ pub fn usage_breakdown_at(
     model: Option<&str>,
     query_end_ms: i64,
 ) -> rusqlite::Result<UsageBreakdown> {
+    usage_breakdown_at_scoped(conn, platform, period, custom, model, None, query_end_ms)
+}
+
+pub fn usage_breakdown_at_scoped(
+    conn: &Connection,
+    platform: &str,
+    period: &str,
+    custom: Option<CustomRange>,
+    model: Option<&str>,
+    connection: Option<&str>,
+    query_end_ms: i64,
+) -> rusqlite::Result<UsageBreakdown> {
     let (start, end) = resolve_range_at(conn, platform, period, custom, query_end_ms);
-    let filter = Filter::new(platform, model, 3);
+    let filter = Filter::new(platform, model, connection, 3);
     let sql = format!(
         "SELECT COUNT(*),
                 MIN({FRESH_INPUT_KNOWN_SQL}), MIN(output_known), MIN(cache_write_known),
@@ -1442,12 +1524,26 @@ pub fn trend(
     trend_at(conn, platform, period, custom, None, Local::now().timestamp_millis())
 }
 
+/// 测试沿用的旧签名：不按连接筛选。
+#[cfg(test)]
 pub fn trend_at(
     conn: &Connection,
     platform: &str,
     period: &str,
     custom: Option<CustomRange>,
     model: Option<&str>,
+    query_end_ms: i64,
+) -> rusqlite::Result<Trend> {
+    trend_at_scoped(conn, platform, period, custom, model, None, query_end_ms)
+}
+
+pub fn trend_at_scoped(
+    conn: &Connection,
+    platform: &str,
+    period: &str,
+    custom: Option<CustomRange>,
+    model: Option<&str>,
+    connection: Option<&str>,
     query_end_ms: i64,
 ) -> rusqlite::Result<Trend> {
     let (start, end) = resolve_range_at(conn, platform, period, custom, query_end_ms);
@@ -1463,7 +1559,7 @@ pub fn trend_at(
     } as usize;
     // 按「桶 × 平台 × 模型」聚合：分项展示只需桶，但计价必须知道是哪个平台的哪个模型，
     // 所以一次查询同时带回两者，前端要的五个系列和费用都从这一份结果里算出来。
-    let filter = Filter::new(platform, model, 4);
+    let filter = Filter::new(platform, model, connection, 4);
     let sql = format!(
         "SELECT CAST((ts - ?1) / ?3 AS INTEGER) AS bucket_index, platform, model,
                 SUM(total_tokens), SUM({FRESH_INPUT_SQL}), SUM(output_tokens),
@@ -1618,6 +1714,8 @@ pub struct CostEstimate {
     pub complete: bool,
 }
 
+/// 测试沿用的旧签名：不按连接筛选。
+#[cfg(test)]
 pub fn cost_estimate_at(
     conn: &Connection,
     platform: &str,
@@ -1626,20 +1724,38 @@ pub fn cost_estimate_at(
     model: Option<&str>,
     query_end_ms: i64,
 ) -> rusqlite::Result<CostEstimate> {
+    cost_estimate_at_scoped(conn, platform, period, custom, model, None, query_end_ms)
+}
+
+pub fn cost_estimate_at_scoped(
+    conn: &Connection,
+    platform: &str,
+    period: &str,
+    custom: Option<CustomRange>,
+    model: Option<&str>,
+    connection: Option<&str>,
+    query_end_ms: i64,
+) -> rusqlite::Result<CostEstimate> {
     let (start, end) = resolve_range_at(conn, platform, period, custom, query_end_ms);
-    let filter = Filter::new(platform, model, 3);
+    let filter = Filter::new(platform, model, connection, 3);
+    // Gemini 的思考 / 工具 Token 在 request_metrics；Pro 系列按单次输入是否超过长提示阈值分档，
+    // 所以分组键多一个 long_prompt，其他平台该列恒为 0，不影响原有口径。
     let sql = format!(
         "SELECT platform, model, SUM(input_tokens), SUM(output_tokens), SUM(cache_write_tokens),
                 SUM(cache_read_tokens), SUM(total_tokens), MIN(input_known), MIN(output_known),
-                MIN(cache_write_known), MIN(cache_read_known), MIN(total_known), MIN({FRESH_INPUT_KNOWN_SQL})
-         FROM requests WHERE ts >= ?1 AND ts < ?2{EXCLUDE_DEGENERATE_SQL}{}
-         GROUP BY platform, model",
-        filter.clause
+                MIN(cache_write_known), MIN(cache_read_known), MIN(total_known), MIN({FRESH_INPUT_KNOWN_SQL}),
+                SUM(COALESCE(m.reasoning, 0)), SUM(COALESCE(m.tool, 0)),
+                CASE WHEN platform = 'gemini' AND input_tokens > {long} THEN 1 ELSE 0 END AS long_prompt
+         FROM requests LEFT JOIN request_metrics m ON m.request_id = requests.id
+         WHERE ts >= ?1 AND ts < ?2{EXCLUDE_DEGENERATE_SQL}{}
+         GROUP BY platform, model, long_prompt",
+        filter.clause, long = crate::pricing::GEMINI_LONG_PROMPT_TOKENS
     );
     let mut stmt = conn.prepare(&sql)?;
-    let map = |r: &rusqlite::Row| -> rusqlite::Result<(String, Option<String>, i64, i64, i64, i64, i64, bool)> {
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<(String, Option<String>, i64, i64, i64, i64, i64, bool, i64, i64, bool)> {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-            (7..=11).all(|index| r.get::<_, i32>(index).unwrap_or(0) != 0)))
+            (7..=11).all(|index| r.get::<_, i32>(index).unwrap_or(0) != 0),
+            r.get(13)?, r.get(14)?, r.get::<_, i32>(15)? != 0))
     };
     let rows: Vec<_> = stmt
         .query_map(rusqlite::params_from_iter(filter.params(&[start, end])), map)?
@@ -1648,12 +1764,14 @@ pub fn cost_estimate_at(
     let mut amount = 0.0;
     let mut uncovered = 0i64;
     let mut complete = true;
-    for (row_platform, model, i, o, cw, cr, total, fields_known) in rows {
+    for (row_platform, model, i, o, cw, cr, total, fields_known, reasoning, tool, long_prompt) in rows {
         if !fields_known {
             complete = false;
             continue;
         }
-        match crate::pricing::estimate(Some(&row_platform), model.as_deref(), i, o, cw, cr) {
+        match crate::pricing::estimate_usage(Some(&row_platform), model.as_deref(), crate::pricing::Usage {
+            input: i, output: o, cache_write: cw, cache_read: cr, reasoning, tool, long_prompt,
+        }) {
             Some(v) => amount += v,
             // 价目表没有该模型：计入未覆盖，不当成 0 元悄悄吞掉
             None => uncovered += total,
@@ -1670,6 +1788,8 @@ pub fn cost_estimate_at(
 /// 默认每页 10 条（界面不显示该文案）；按时间从新到旧
 pub const PAGE_SIZE: u32 = 10;
 
+/// 测试沿用的旧签名：不按连接筛选。
+#[cfg(test)]
 pub fn request_log_at(
     conn: &Connection,
     platform: &str,
@@ -1679,8 +1799,21 @@ pub fn request_log_at(
     model: Option<&str>,
     query_end_ms: i64,
 ) -> rusqlite::Result<LogPage> {
+    request_log_at_scoped(conn, platform, period, page, custom, model, None, query_end_ms)
+}
+
+pub fn request_log_at_scoped(
+    conn: &Connection,
+    platform: &str,
+    period: &str,
+    page: u32,
+    custom: Option<CustomRange>,
+    model: Option<&str>,
+    connection: Option<&str>,
+    query_end_ms: i64,
+) -> rusqlite::Result<LogPage> {
     let (start, end) = resolve_range_at(conn, platform, period, custom, query_end_ms);
-    let filter = Filter::new(platform, model, 3);
+    let filter = Filter::new(platform, model, connection, 3);
     let clause = filter.clause.as_str();
 
     let count_sql =
@@ -1701,8 +1834,10 @@ pub fn request_log_at(
                 CASE WHEN cache_write_known = 1 THEN cache_write_tokens END,
                 CASE WHEN total_known = 1 THEN total_tokens END,
                 session_id, platform, effort,
-                duration_ms, first_token_ms, status_code, input_semantics, native_outcome
-         FROM requests WHERE ts >= ?1 AND ts < ?2{clause}
+                duration_ms, first_token_ms, status_code, input_semantics, native_outcome,
+                m.reasoning, m.tool
+         FROM requests LEFT JOIN request_metrics m ON m.request_id = requests.id
+         WHERE ts >= ?1 AND ts < ?2{clause}
          ORDER BY ts DESC LIMIT {PAGE_SIZE} OFFSET {offset}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1715,13 +1850,19 @@ pub fn request_log_at(
         let cache_read: Option<i64> = r.get(5)?;
         let cache_write: Option<i64> = r.get(6)?;
         let row_platform: String = r.get(9)?;
+        let reasoning: Option<i64> = r.get(16)?;
+        let tool: Option<i64> = r.get(17)?;
         Ok(LogRow {
             id: r.get(0)?,
             time: dt.map(|d| d.format("%H:%M:%S").to_string()).unwrap_or_default(),
             date: dt.map(|d| d.format("%Y/%m/%d").to_string()).unwrap_or_default(),
             cost_estimate: input.zip(output).zip(cache_write).zip(cache_read)
-                .and_then(|(((input, output), cache_write), cache_read)| crate::pricing::estimate(
-                    Some(&row_platform), model.as_deref(), input, output, cache_write, cache_read,
+                .and_then(|(((input, output), cache_write), cache_read)| crate::pricing::estimate_usage(
+                    Some(&row_platform), model.as_deref(), crate::pricing::Usage {
+                        input, output, cache_write, cache_read,
+                        reasoning: reasoning.unwrap_or(0), tool: tool.unwrap_or(0),
+                        long_prompt: input > crate::pricing::GEMINI_LONG_PROMPT_TOKENS,
+                    },
                 )),
             model,
             input_semantics: r.get(14)?,
@@ -1807,7 +1948,7 @@ mod tests {
         insert_records(&mut conn, &[record("msg_known")]).unwrap();
 
         // 命中：三列写入，且只影响目标行
-        let updated = super::apply_proxy_timing(&conn, "msg_known", 320, 4_500, 200).unwrap();
+        let updated = super::apply_proxy_timing(&conn, "msg_known", 320, 4_500, 200, None).unwrap();
         assert_eq!(updated, 1);
         let (first, duration, status): (Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
             "SELECT first_token_ms, duration_ms, status_code FROM requests WHERE dedup_key = 'msg_known'",
@@ -1816,7 +1957,7 @@ mod tests {
         assert_eq!((first, duration, status), (Some(320), Some(4_500), Some(200)));
 
         // 未命中（记录还没入库）：返回 0，调用方转入待关联队列
-        let updated = super::apply_proxy_timing(&conn, "msg_missing", 10, 20, 200).unwrap();
+        let updated = super::apply_proxy_timing(&conn, "msg_missing", 10, 20, 200, None).unwrap();
         assert_eq!(updated, 0);
     }
 
@@ -1954,6 +2095,33 @@ mod tests {
 
         let usage = live_usage(&conn, "codex", None).unwrap();
         assert!(usage.active_sessions.is_empty());
+    }
+
+    #[test]
+    fn zcode_recent_sessions_carry_real_states_but_other_native_sources_stay_recent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let now = Local::now().timestamp_millis();
+        let record = |platform: &str, key: &str, session: &str| RequestRecord {
+            platform: platform.into(), source: "native".into(), dedup_key: key.into(),
+            session_id: Some(session.into()), ts: now - 1_000, model: None,
+            input_tokens: Some(10), output_tokens: Some(5), cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0), total_tokens: Some(15), effort: None,
+        };
+        insert_records(&mut conn, &[
+            record("zcode", "z1", "zcode-run"), record("zcode", "z2", "zcode-done"),
+            record("workbuddy", "w1", "wb-done"),
+        ]).unwrap();
+        set_session_activity(&conn, "zcode", "zcode-run", "running", now).unwrap();
+        set_session_activity(&conn, "zcode", "zcode-done", "done", now).unwrap();
+        set_session_activity(&conn, "workbuddy", "wb-done", "done", now).unwrap();
+        let mut zcode: Vec<(String, String)> = live_usage(&conn, "zcode", None).unwrap().active_sessions
+            .into_iter().map(|s| (s.session_id, s.state)).collect();
+        zcode.sort();
+        assert_eq!(zcode, vec![("zcode-done".into(), "done".into()), ("zcode-run".into(), "running".into())]);
+        let workbuddy = live_usage(&conn, "workbuddy", None).unwrap().active_sessions;
+        assert_eq!(workbuddy.len(), 1);
+        assert_eq!(workbuddy[0].state, "recent", "没有可信生命周期的来源不借用 done 状态");
     }
 
     #[test]

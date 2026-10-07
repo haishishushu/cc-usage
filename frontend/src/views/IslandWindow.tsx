@@ -291,7 +291,7 @@ export function IslandWindow() {
         deltaCountKey: "total",
         deltaPhase: live.deltaPhase,
         status: nativeMonitor && active?.status === "connected" ? { tone: "success", label: "本机监控" } : islandConnectionStatus(active?.status ?? null, false, Boolean(profile.connection_id)),
-        sourceText: `${collection.status && !collection.status.ok ? `采集异常：${collection.status.errors.join("；")} · ` : ""}${officialApiUsage.state?.state === "ok" ? `API 用量来源：${officialApiUsage.state.source} · ` : ""}统计来源：本机 ${PLATFORM_NAMES[islandPlatform] ?? islandPlatform} 会话记录（无法按账号区分）· ${live.activityKind === "running" ? "按本轮开始／结束事件及会话存活状态判断；思考、等待输入及压缩期间保留会话与 Token" : `${live.activeWindowSeconds} 秒内有新记录视为最近活跃`}`,
+        sourceText: `${collection.status && !collection.status.ok ? `采集异常：${collection.status.errors.join("；")} · ` : ""}${officialApiUsage.state?.state === "ok" ? `API 用量来源：${officialApiUsage.state.source} · ` : ""}统计来源：本机 ${PLATFORM_NAMES[islandPlatform] ?? islandPlatform} 会话记录（无法按账号区分）· ${live.activityKind === "running" ? "按本轮开始／结束事件及会话存活状态判断；思考、等待输入及压缩期间保留会话与 Token" : islandPlatform === "zcode" ? `${live.activeWindowSeconds} 秒内有新记录视为最近活跃；完成 / 失败 / 运行中按本机库的请求状态标注` : `${live.activeWindowSeconds} 秒内有新记录视为最近活跃`}`,
       }
     : {
         platform: "claude",

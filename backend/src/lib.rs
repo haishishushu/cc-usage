@@ -756,11 +756,12 @@ async fn token_totals(
     platform: String,
     custom: Option<db::CustomRange>,
     model: Option<String>,
+    connection: Option<String>,
     query_end_ms: i64,
 ) -> Result<db::PeriodTotals, String> {
     validate_query_range(custom, query_end_ms)?;
     with_reader(db.0.clone(), move |conn| {
-        db::token_totals_at(conn, &platform, custom, model.as_deref(), query_end_ms)
+        db::token_totals_at_scoped(conn, &platform, custom, model.as_deref(), connection.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
     .await
@@ -786,11 +787,12 @@ async fn usage_breakdown(
     period: String,
     custom: Option<db::CustomRange>,
     model: Option<String>,
+    connection: Option<String>,
     query_end_ms: i64,
 ) -> Result<db::UsageBreakdown, String> {
     validate_query_range(custom, query_end_ms)?;
     with_reader(db.0.clone(), move |conn| {
-        db::usage_breakdown_at(conn, &platform, &period, custom, model.as_deref(), query_end_ms)
+        db::usage_breakdown_at_scoped(conn, &platform, &period, custom, model.as_deref(), connection.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
     .await
@@ -803,11 +805,12 @@ async fn list_models(
     platform: String,
     period: String,
     custom: Option<db::CustomRange>,
+    connection: Option<String>,
     query_end_ms: i64,
 ) -> Result<Vec<String>, String> {
     validate_query_range(custom, query_end_ms)?;
     with_reader(db.0.clone(), move |conn| {
-        db::list_models_at(conn, &platform, &period, custom, query_end_ms).map_err(|e| e.to_string())
+        db::list_models_at_scoped(conn, &platform, &period, custom, connection.as_deref(), query_end_ms).map_err(|e| e.to_string())
     })
     .await
 }
@@ -852,11 +855,12 @@ async fn usage_trend(
     period: String,
     custom: Option<db::CustomRange>,
     model: Option<String>,
+    connection: Option<String>,
     query_end_ms: i64,
 ) -> Result<db::Trend, String> {
     validate_query_range(custom, query_end_ms)?;
     with_reader(db.0.clone(), move |conn| {
-        db::trend_at(conn, &platform, &period, custom, model.as_deref(), query_end_ms)
+        db::trend_at_scoped(conn, &platform, &period, custom, model.as_deref(), connection.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
     .await
@@ -870,11 +874,12 @@ async fn request_log(
     page: u32,
     custom: Option<db::CustomRange>,
     model: Option<String>,
+    connection: Option<String>,
     query_end_ms: i64,
 ) -> Result<db::LogPage, String> {
     validate_query_range(custom, query_end_ms)?;
     with_reader(db.0.clone(), move |conn| {
-        db::request_log_at(conn, &platform, &period, page, custom, model.as_deref(), query_end_ms)
+        db::request_log_at_scoped(conn, &platform, &period, page, custom, model.as_deref(), connection.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
     .await
@@ -1211,6 +1216,12 @@ fn dock_undock_for(app: &tauri::AppHandle, w: &WebviewWindow, id: Option<&str>) 
 }
 
 /// 区间内的估算费用（§2.4）。本地记录不含账单，界面必须标注「估算」
+/// 经本地代理归账到该连接的请求数；主面板据此决定是否提供「仅此连接」统计范围。
+#[tauri::command]
+async fn connection_attributed_count(db: State<'_, DbRead>, id: String) -> Result<i64, String> {
+    with_reader(db.0.clone(), move |conn| db::attributed_request_count(conn, &id).map_err(|e| e.to_string())).await
+}
+
 #[tauri::command]
 async fn cost_estimate(
     db: State<'_, DbRead>,
@@ -1218,11 +1229,12 @@ async fn cost_estimate(
     period: String,
     custom: Option<db::CustomRange>,
     model: Option<String>,
+    connection: Option<String>,
     query_end_ms: i64,
 ) -> Result<db::CostEstimate, String> {
     validate_query_range(custom, query_end_ms)?;
     with_reader(db.0.clone(), move |conn| {
-        db::cost_estimate_at(conn, &platform, &period, custom, model.as_deref(), query_end_ms)
+        db::cost_estimate_at_scoped(conn, &platform, &period, custom, model.as_deref(), connection.as_deref(), query_end_ms)
             .map_err(|e| e.to_string())
     })
     .await
@@ -2766,6 +2778,7 @@ pub fn run() {
             dock_release,
             dock_undock,
             cost_estimate,
+            connection_attributed_count,
             connection_quota,
             connection_api_usage,
             local_codex_quota,

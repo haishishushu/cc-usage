@@ -313,12 +313,13 @@ export function useCostEstimate(
   queryEndMs?: number,
   model?: string | null,
   enabled = true,
+  connection: string | null = null,
 ) {
   const [data, setData] = useState<CostEstimateDto | null>(null)
   const owner = useRef<string | null>(null)
 
   useEffect(() => {
-    const query = JSON.stringify([platform, period, custom?.start, custom?.end, model])
+    const query = JSON.stringify([platform, period, custom?.start, custom?.end, model, connection])
     if (owner.current !== query) setData(null)
     owner.current = query
     if (!enabled || !isTauri || (period === "custom" && !custom)) return
@@ -327,7 +328,7 @@ export function useCostEstimate(
     const offs: Array<() => void> = []
     const refresh = () => {
       const request = ++serial
-      void api.costEstimate(platform, period, custom ?? null, model ?? null, queryEndMs ?? Date.now())
+      void api.costEstimate(platform, period, custom ?? null, model ?? null, queryEndMs ?? Date.now(), connection)
         .then(r => { if (!cancelled && serial === request) setData(r) })
         .catch(() => { if (!cancelled && serial === request) setData(null) })
     }
@@ -343,7 +344,7 @@ export function useCostEstimate(
       cancelled = true
       offs.forEach(off => off())
     }
-  }, [platform, period, custom, queryEndMs, model, enabled])
+  }, [platform, period, custom, queryEndMs, model, enabled, connection])
 
   return data
 }

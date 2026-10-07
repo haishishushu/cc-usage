@@ -39,7 +39,8 @@
       "auth_connection",
       "api_connection",
       "local_sessions",
-      "realtime_delta"
+      "realtime_delta",
+      "cost_estimate"
     ],
     "limitation": "本机 Gemini CLI 留存会话；在线剩余额度未接入"
   },

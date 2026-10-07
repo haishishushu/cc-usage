@@ -28,6 +28,7 @@ use futures_util::StreamExt;
 use tauri::{Emitter, Manager};
 
 use crate::proxy_config::{is_self_base, ProxyPlatform};
+use sha2::{Digest, Sha256};
 
 /// 响应流头部快照上限：Claude `message_start` 与 Codex `response.created`
 /// 都在流的最开头，64 KiB 足以覆盖，同时防止大响应常驻内存。
@@ -47,6 +48,34 @@ pub(crate) struct PendingTiming {
     pub duration_ms: i64,
     pub status_code: i64,
     pub created_ms: i64,
+    /// 按请求凭证指纹匹配到的 API Key 连接；匹配不到为 None，记录保持无归属。
+    pub connection_id: Option<String>,
+}
+
+/// 凭证指纹索引：API Key 连接的 SHA-256 → 连接 id。只在内存里保存哈希，定期重建以跟随连接变更。
+#[derive(Default)]
+pub(crate) struct KeyIndex {
+    refreshed_ms: i64,
+    entries: Vec<(ProxyPlatform, [u8; 32], String)>,
+}
+const KEY_INDEX_TTL_MS: i64 = 30_000;
+
+fn fingerprint(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.trim().as_bytes()).into()
+}
+
+/// 请求携带的凭证：Claude 优先 x-api-key，其次 Bearer；Codex 用 Bearer。原值只用于哈希，不保存。
+fn request_credential(platform: ProxyPlatform, headers: &HeaderMap) -> Option<String> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+    let bearer = header("authorization")
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match platform {
+        ProxyPlatform::Claude => header("x-api-key").or(bearer),
+        _ => bearer,
+    }
+    .map(str::to_string)
 }
 
 /// 生产环境的待关联队列与最近错误。独立于运行时存在，便于 [`flush_pending`] 随时访问。
@@ -71,6 +100,7 @@ pub(crate) struct ProxyDeps {
     pending: Arc<Mutex<Vec<PendingTiming>>>,
     consecutive_failures: Arc<AtomicU32>,
     fallback_enabled: bool,
+    key_index: Mutex<KeyIndex>,
     shutdown: Arc<tokio::sync::watch::Sender<bool>>,
     /// 触发回退时的收尾动作（生产：还原 CLI 配置 + 停止监听 + 通知前端）。
     on_fallback: Arc<dyn Fn(&str) + Send + Sync>,
@@ -257,15 +287,42 @@ impl ProxyDeps {
         None
     }
 
+    /// 按请求凭证找到对应的 API Key 连接。索引过期时用写连接 try_lock 重建，拿不到锁就沿用旧索引。
+    pub(crate) fn connection_for(&self, platform: ProxyPlatform, headers: &HeaderMap) -> Option<String> {
+        let credential = request_credential(platform, headers)?;
+        let digest = fingerprint(&credential);
+        let mut index = self.key_index.lock().ok()?;
+        let now = now_ms();
+        if now - index.refreshed_ms > KEY_INDEX_TTL_MS || index.refreshed_ms == 0 {
+            if let Ok(conn) = self.db.try_lock() {
+                if let Ok(rows) = crate::connections::api_key_secrets(&conn) {
+                    index.entries = rows
+                        .into_iter()
+                        .filter_map(|(id, platform, secret)| {
+                            let platform = match platform.as_str() {
+                                "claude" => ProxyPlatform::Claude,
+                                "codex" => ProxyPlatform::Codex,
+                                _ => return None,
+                            };
+                            Some((platform, fingerprint(&secret), id))
+                        })
+                        .collect();
+                    index.refreshed_ms = now;
+                }
+            }
+        }
+        index.entries.iter().find(|(p, f, _)| *p == platform && *f == digest).map(|(_, _, id)| id.clone())
+    }
+
     /// 计时落库：提取去重键 → 回填 requests 行；记录未入库时转入待关联队列。
-    fn settle_timing(&self, platform: ProxyPlatform, head: &[u8], first: i64, duration: i64, status: i64) {
+    fn settle_timing(&self, platform: ProxyPlatform, head: &[u8], first: i64, duration: i64, status: i64, connection_id: Option<&str>) {
         let Some(dedup_key) = extract_dedup_key(platform, head) else {
             return;
         };
         // 这里跑在转发流的异步任务里：写锁被采集占用时不阻塞运行时线程，
         // 直接转入待关联队列，由采集下一轮扫描后补写（flush_pending）。
         let applied = match self.db.try_lock() {
-            Ok(conn) => crate::db::apply_proxy_timing(&conn, &dedup_key, first, duration, status).unwrap_or(0),
+            Ok(conn) => crate::db::apply_proxy_timing(&conn, &dedup_key, first, duration, status, connection_id).unwrap_or(0),
             Err(_) => 0,
         };
         if applied == 0 {
@@ -276,6 +333,7 @@ impl ProxyDeps {
                     duration_ms: duration,
                     status_code: status,
                     created_ms: now_ms(),
+                    connection_id: connection_id.map(str::to_string),
                 });
             }
         }
@@ -309,6 +367,7 @@ impl ProxyDeps {
 struct TimingCore {
     deps: Arc<ProxyDeps>,
     platform: ProxyPlatform,
+    connection_id: Option<String>,
     t0: Instant,
     status: StatusCode,
     first_ms: Option<i64>,
@@ -330,7 +389,7 @@ impl TimingCore {
         let duration = elapsed_ms(self.t0);
         let first = self.first_ms.unwrap_or(duration);
         self.deps
-            .settle_timing(self.platform, &self.head, first, duration, self.status.as_u16() as i64);
+            .settle_timing(self.platform, &self.head, first, duration, self.status.as_u16() as i64, self.connection_id.as_deref());
     }
 }
 
@@ -377,6 +436,8 @@ async fn forward(State(deps): State<Arc<ProxyDeps>>, request: Request) -> Respon
             "本地代理：无法判定该请求属于哪个平台的上游（多平台接管时不猜测）",
         );
     };
+    // 归账：按请求凭证指纹匹配 API Key 连接；OAuth 令牌会轮换，不参与匹配。
+    let connection_id = deps.connection_for(platform, &parts.headers);
 
     let body_bytes = match axum::body::to_bytes(body, REQUEST_BODY_LIMIT).await {
         Ok(bytes) => bytes,
@@ -408,6 +469,7 @@ async fn forward(State(deps): State<Arc<ProxyDeps>>, request: Request) -> Respon
     let core = TimingCore {
         deps: deps.clone(),
         platform,
+        connection_id,
         t0,
         status,
         first_ms: None,
@@ -575,6 +637,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<(), String> {
         pending: PENDING.clone(),
         consecutive_failures: Arc::new(AtomicU32::new(0)),
         fallback_enabled: settings.proxy_fallback_direct,
+        key_index: Mutex::new(KeyIndex::default()),
         shutdown: shutdown.clone(),
         on_fallback,
     });
@@ -796,6 +859,7 @@ pub(crate) fn flush_entries(conn: &rusqlite::Connection, queue: &mut Vec<Pending
             entry.first_token_ms,
             entry.duration_ms,
             entry.status_code,
+            entry.connection_id.as_deref(),
         )
         .unwrap_or(0);
         if applied == 0 && entry.created_ms >= cutoff {
@@ -874,6 +938,7 @@ mod tests {
             pending: Arc::new(Mutex::new(Vec::new())),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             fallback_enabled: fallback.is_some(),
+            key_index: Mutex::new(KeyIndex::default()),
             shutdown: Arc::new(shutdown_tx),
             on_fallback: Arc::new(move |reason: &str| {
                 assert!(reason.contains("上游不可达"));
@@ -1008,6 +1073,7 @@ mod tests {
 
         let mut queue = vec![
             PendingTiming {
+                connection_id: None,
                 dedup_key: "msg_late".into(),
                 first_token_ms: 120,
                 duration_ms: 900,
@@ -1015,6 +1081,7 @@ mod tests {
                 created_ms: now_ms(),
             },
             PendingTiming {
+                connection_id: None,
                 dedup_key: "msg_expired".into(),
                 first_token_ms: 1,
                 duration_ms: 2,
@@ -1036,9 +1103,34 @@ mod tests {
     }
 
     #[test]
+    fn proxied_request_is_attributed_to_matching_api_key_connection() {
+        let mut conn = memory_db();
+        crate::db::insert_records(&mut conn, &[record("msg_attr")]).unwrap();
+        conn.execute("INSERT INTO connections(id,platform,kind,name,secret,created_ms) VALUES('claude-abc','claude','api','网关','sk-test-key',1)", []).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (deps, _rx) = test_deps(db.clone(), HashMap::from([(ProxyPlatform::Claude, "http://127.0.0.1:9".to_string())]), None);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-test-key".parse().unwrap());
+        assert_eq!(deps.connection_for(ProxyPlatform::Claude, &headers).as_deref(), Some("claude-abc"));
+        headers.insert("x-api-key", "sk-other".parse().unwrap());
+        assert_eq!(deps.connection_for(ProxyPlatform::Claude, &headers), None, "凭证不匹配不归账");
+        let mut bearer = HeaderMap::new();
+        bearer.insert("authorization", "Bearer sk-test-key".parse().unwrap());
+        assert_eq!(deps.connection_for(ProxyPlatform::Codex, &bearer), None, "平台不同的同名 Key 不归账");
+        assert_eq!(deps.connection_for(ProxyPlatform::Claude, &bearer).as_deref(), Some("claude-abc"));
+        let mut queue = vec![PendingTiming { dedup_key: "msg_attr".into(), first_token_ms: 1, duration_ms: 2, status_code: 200, created_ms: now_ms(), connection_id: Some("claude-abc".into()) }];
+        flush_entries(&db.lock().unwrap(), &mut queue).unwrap();
+        let attributed: Option<String> = db.lock().unwrap().query_row("SELECT connection_id FROM requests WHERE dedup_key='msg_attr'", [], |r| r.get(0)).unwrap();
+        assert_eq!(attributed.as_deref(), Some("claude-abc"));
+        assert_eq!(crate::db::attributed_request_count(&db.lock().unwrap(), "claude-abc").unwrap(), 1);
+        assert_eq!(crate::db::attributed_request_count(&db.lock().unwrap(), "claude-none").unwrap(), 0);
+    }
+
+    #[test]
     fn pending_entry_kept_until_record_arrives() {
         let conn = memory_db();
         let mut queue = vec![PendingTiming {
+                connection_id: None,
             dedup_key: "msg_wait".into(),
             first_token_ms: 50,
             duration_ms: 400,

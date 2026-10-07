@@ -31,5 +31,9 @@ export function NativeSourcePanel({ platform, period, custom, model, queryEndMs 
       <div><p className="text-xs text-text-secondary">区间上报积分</p><p className="tnum text-xl font-semibold">{metrics.data?.credits?.toLocaleString("zh-CN", { maximumFractionDigits: 4 }) ?? "—"}</p><p className="text-[11px] text-text-tertiary">{metrics.data?.credit_requests ?? "—"} 条含积分记录；不等于实际扣款或余额</p></div>
       <div><p className="text-xs text-text-secondary">最近上下文占用</p><p className="tnum text-xl font-semibold">{metrics.data?.context_ratio == null ? "—" : `${(metrics.data.context_ratio * 100).toFixed(1)}%`}</p><p className="text-[11px] text-text-tertiary">{metrics.data?.context_at_ms ? new Date(metrics.data.context_at_ms).toLocaleString("zh-CN") : "该范围暂无上下文快照"} · 非套餐额度</p></div>
     </div>}
+    {(metrics.data?.reasoning != null || metrics.data?.tool != null) && <div className="flex flex-wrap gap-6 border-t pt-3">
+      <div><p className="text-xs text-text-secondary">区间思考 Token</p><p className="tnum text-xl font-semibold">{metrics.data?.reasoning?.toLocaleString("en-US") ?? "—"}</p><p className="text-[11px] text-text-tertiary">来源记录的思考 / 推理 Token；已计入总量</p></div>
+      <div><p className="text-xs text-text-secondary">区间工具 Token</p><p className="tnum text-xl font-semibold">{metrics.data?.tool?.toLocaleString("en-US") ?? "—"}</p><p className="text-[11px] text-text-tertiary">工具调用提示 Token（Gemini tokens.tool）；来源未提供时显示 —</p></div>
+    </div>}
   </section>
 }

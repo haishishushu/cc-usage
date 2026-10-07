@@ -1,5 +1,7 @@
 # 八个平台完整接入实施计划
 
+> 2026-10-01 核对：以下复选框按代码现状补勾（能力表、Gemini / Zcode / Workbuddy 适配器与测试、`unknown` 状态、`list_sources`、`unsupported` 原因）。未勾项为未逐条核对或仍未完成；Zcode 会话状态与 Gemini `tokens.tool` 的后续补全见 `todo/2026-10-01-platform-completion.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** 完成 Claude、Codex、Gemini、Grok、Zcode、Trae、Qoder、Workbuddy 的平台能力、连接操作、真实数据采集及统计／灵动岛联动；逐项报告实际可用与无法验证的能力。
@@ -60,7 +62,7 @@ pub fn platform_catalog() -> Vec<PlatformDto>;
 
 能力 ID 为 `local_connection`、`api_connection`、`remote_validation`、`external_switch`、`local_sessions`、`token_usage`、`credits`、`context_usage`、`subscription_quota`、`gateway_balance`、`cost_estimate`。配置未找到属于来源状态，不把已实现的能力改成未实现。
 
-- [ ] 写失败测试：八个正确 ID 接受，`tare` 和任意未知 ID 拒绝；读取 Trae 本机连接不再被 Claude／Codex 白名单提前拒绝。
+- [x] 写失败测试：八个正确 ID 接受，`tare` 和任意未知 ID 拒绝；读取 Trae 本机连接不再被 Claude／Codex 白名单提前拒绝。
 
 ```rust
 #[test]
@@ -74,9 +76,9 @@ fn catalog_accepts_all_eight_ids_and_rejects_typo() {
 ```
 
 - [ ] `cargo test --manifest-path backend/Cargo.toml catalog_accepts_all_eight_ids_and_rejects_typo`，记录首次失败。
-- [ ] 实现后端能力表与 `platform_catalog` Tauri 命令；`prepare_new`、`local_connections`、导入校验使用同一 ID 校验。未知平台不回落 Claude。
-- [ ] 前端保留图标与名称静态配置；运行时按钮能力由后端目录决定。读取失败时显示失败，不擅自启用所有能力。
-- [ ] 运行该后端测试及前端能力测试：未验证能力不宣称支持，已支持但无配置显示“未配置”。
+- [x] 实现后端能力表与 `platform_catalog` Tauri 命令；`prepare_new`、`local_connections`、导入校验使用同一 ID 校验。未知平台不回落 Claude。
+- [x] 前端保留图标与名称静态配置；运行时按钮能力由后端目录决定。读取失败时显示失败，不擅自启用所有能力。
+- [x] 运行该后端测试及前端能力测试：未验证能力不宣称支持，已支持但无配置显示“未配置”。
 
 ## 任务 2：统一来源、计量单位与幂等写入
 
@@ -184,9 +186,9 @@ pub fn scan(home: &std::path::Path, app_data: &std::path::Path) -> AdapterResult
 
 Gemini 官方记录字段：`tokens.input`、`output`、`cached`、`thoughts`、`tool`、`total`。总量采用 `total`，不把 thoughts 再加到总量；输出分项与思考分项分开保存。input 已包含缓存，创建量无字段时未知。来源仅扫描 `.gemini/tmp/*/chats/session-*`，不将 Antigravity 目录当 CLI。
 
-- [ ] 写 Gemini 失败测试：JSON 会话、JSONL 消息、同 ID 替换、`$set` checkpoint、`$rewindTo`、JSON/JSONL 迁移共存、部分尾行；合成输入 `input=1000,output=20,cached=800,thoughts=10,total=1030` 保留总量 1030。
-- [ ] 实现 Gemini 记录重建及格式版本识别；无法判定生命周期时会话状态为未知，不用 mtime 推定正在生成。
-- [ ] Gemini API Key 使用官方接口只读验证；OAuth 不复用到猜测接口。没有已验证额度响应时返回限定范围的 `unsupported`，本地 Token 统计仍工作。
+- [x] 写 Gemini 失败测试：JSON 会话、JSONL 消息、同 ID 替换、`$set` checkpoint、`$rewindTo`、JSON/JSONL 迁移共存、部分尾行；合成输入 `input=1000,output=20,cached=800,thoughts=10,total=1030` 保留总量 1030。
+- [x] 实现 Gemini 记录重建及格式版本识别；无法判定生命周期时会话状态为未知，不用 mtime 推定正在生成。
+- [x] Gemini API Key 使用官方接口只读验证；OAuth 不复用到猜测接口。没有已验证额度响应时返回限定范围的 `unsupported`，本地 Token 统计仍工作。
 - [ ] Grok 接入现有本机 OAuth 解析和额度模块到正式连接 ID；过期、gRPC 非零状态、空响应与字段不明测试不返回假额度。xAI API Key 与 Grok OAuth 不混用。xAI API Key 使用 `GET https://api.x.ai/v1/api-key` 只读检测，200 后还需检查 `api_key_blocked/api_key_disabled/team_blocked`，任一为 true 不能验证成功。
 - [ ] xAI 账户余额仅在用户提供独立 Management key 和 team ID 时查询 `https://management-api.x.ai/v1/billing/teams/{team_id}/prepaid/balance`；普通 API Key 不尝试管理端点。该能力与消费版 Grok 积分独立展示，金额符号和美分单位按已验证响应保留。
 - [ ] Trae 必须使用 Trae IDE 的官方／实际格式；不得使用 `bytedance/trae-agent` 的 CLI 日志代替。未取得可验证格式前，本机来源检测与能力限制可交付，Trae 会话／额度适配在验收表明确列为未完成，不宣称八平台全部完成。
@@ -198,16 +200,16 @@ Gemini 官方记录字段：`tokens.input`、`output`、`cached`、`thoughts`、
 
 适配器复用任务 4 的 `AdapterResult`。详细来源依据补在本计划“本机核实记录”。
 
-- [ ] Zcode 使用 `.zcode/cli/db/db.sqlite` 的 `model_usage`，以 `id` 为记录键，关联 `session.id`；`logical_request_id/attempt_index` 只保留关联信息，不把不同已消耗重试折叠成一次。`turn_usage` 已是聚合，不再额外累计。时间用 `completed_at`，未完成时以 `started_at` 保留状态；总量优先 `provider_total_tokens`，回退 `computed_total_tokens`。
-- [ ] Zcode 输入口径以 provider 类型及 raw_usage 白名单验证。已核实的本机样本 `input=14210,output=235,cache_read=11712,total=14445` 为含缓存输入，不能用 Claude 口径重复加缓存。失败行的缺失总量不能仅凭数据库默认零当作实际零用量。
-- [ ] Zcode 合成 SQLite 测试：相同轮次更新、reasoning 与 total 同时存在、缓存字段缺失、损坏数据库、数据库不存在不被创建、WAL 更新；其中含真实数值 `cache_creation_input_tokens` 时必须出现在最终分项。
+- [x] Zcode 使用 `.zcode/cli/db/db.sqlite` 的 `model_usage`，以 `id` 为记录键，关联 `session.id`；`logical_request_id/attempt_index` 只保留关联信息，不把不同已消耗重试折叠成一次。`turn_usage` 已是聚合，不再额外累计。时间用 `completed_at`，未完成时以 `started_at` 保留状态；总量优先 `provider_total_tokens`，回退 `computed_total_tokens`。
+- [x] Zcode 输入口径以 provider 类型及 raw_usage 白名单验证。已核实的本机样本 `input=14210,output=235,cache_read=11712,total=14445` 为含缓存输入，不能用 Claude 口径重复加缓存。失败行的缺失总量不能仅凭数据库默认零当作实际零用量。
+- [x] Zcode 合成 SQLite 测试：相同轮次更新、reasoning 与 total 同时存在、缓存字段缺失、损坏数据库、数据库不存在不被创建、WAL 更新；其中含真实数值 `cache_creation_input_tokens` 时必须出现在最终分项。
 - [ ] Qoder 扫描 `.qoder/projects` 与 `.qoder-cn/projects`，请求去重优先 `request_id` 再 `message.id`，同消息多个 assistant 分片只计一次。国际／国内来源前缀分开。
 - [ ] Qoder 测试：两个分片共用 message.id，最终积分 0.64880178 只记一次；`isApiErrorMessage` 无 usage 不产生零用量；`tokenCountsAvailable=false` 下零 Token 保持未知；有明确已知标记的真实 0 保留。保留 `billable=false` 与 `original_credits`，积分不能标成已经扣除的余额。
 - [ ] Token 可用性标记必须关联到同一来源／会话及可验证时间范围；不能把当前 snapshot 的 false 追溯覆盖全部历史有值记录。标记无法关联的零值保留来源报告并附完整性未知，不自行补出正数。
-- [ ] Workbuddy 分别读取 `.workbuddy/projects/**/*.jsonl` 和 `.workbuddy-ai/projects/**/*.jsonl` 的 `providerData`；包含 `function_call` 等所有携带 usage 的记录，不能只筛 assistant message。稳定键优先 `record.id`，回退 `record.messageId`；同 `conversationRequestId` 的多个调用都保留。
-- [ ] Workbuddy 映射 `usage.inputTokens/outputTokens/totalTokens` 及 `rawUsage.prompt_tokens/completion_tokens/total_tokens`；OpenAI 形状 input 已含缓存。缓存命中优先 `prompt_tokens_details.cached_tokens`、再 `prompt_cache_hit_tokens`，不能被 `cache_read_input_tokens=0` 抢先覆盖。缓存创建仅采用语义已核实的 `cache_creation_input_tokens/prompt_cache_write_tokens`；rawUsage 形状变化时报来源格式错误，不默认套协议。
-- [ ] Workbuddy 原生 SQLite 仅补充会话和上下文快照，`session_usage.used/size` 不进入消耗总量。`rawUsage.credit` 为请求积分，以 JSONL 为明细主来源；`credit_json` 是累计校验来源，不能再加一次。
-- [ ] Workbuddy 测试：上下文快照下降不变成负消耗；多次相同快照不增加总量；无 Token 分项时保留未知；数据库锁定仅影响该来源并保留最后成功时间。
+- [x] Workbuddy 分别读取 `.workbuddy/projects/**/*.jsonl` 和 `.workbuddy-ai/projects/**/*.jsonl` 的 `providerData`；包含 `function_call` 等所有携带 usage 的记录，不能只筛 assistant message。稳定键优先 `record.id`，回退 `record.messageId`；同 `conversationRequestId` 的多个调用都保留。
+- [x] Workbuddy 映射 `usage.inputTokens/outputTokens/totalTokens` 及 `rawUsage.prompt_tokens/completion_tokens/total_tokens`；OpenAI 形状 input 已含缓存。缓存命中优先 `prompt_tokens_details.cached_tokens`、再 `prompt_cache_hit_tokens`，不能被 `cache_read_input_tokens=0` 抢先覆盖。缓存创建仅采用语义已核实的 `cache_creation_input_tokens/prompt_cache_write_tokens`；rawUsage 形状变化时报来源格式错误，不默认套协议。
+- [x] Workbuddy 原生 SQLite 仅补充会话和上下文快照，`session_usage.used/size` 不进入消耗总量。`rawUsage.credit` 为请求积分，以 JSONL 为明细主来源；`credit_json` 是累计校验来源，不能再加一次。
+- [x] Workbuddy 测试：上下文快照下降不变成负消耗；多次相同快照不增加总量；无 Token 分项时保留未知；数据库锁定仅影响该来源并保留最后成功时间。
 - [ ] 凭证状态读取限明确格式；加密容器不能当 token，无法可靠读取时返回“不支持读取此登录格式”，不会记录虚假连接成功。
 - [ ] Qoder 登录快照读取 `.qoder[-cn]/.qoder-app-status.json` 的 `logged_in/snapshot_at`，只标带时间的登录状态。桌面 `auth.v1.dat` 是 Electron safeStorage 加密容器，不自行当 JSON 读取或输出；未接通授权凭证读取前不宣称在线额度可用。
 - [ ] 运行三个适配器单测，再执行不打印身份或正文的本机只读核对；报告请求数、来源数及可用字段，不导出私密原始行。
@@ -218,11 +220,11 @@ Gemini 官方记录字段：`tokens.input`、`output`、`cached`、`thoughts`、
 
 - [ ] 失败测试：任一来源打不开，其他适配器仍入库；第一次目录缺失后新建目录，心跳可发现；SQLite WAL 更新触发重新读取；当前来源无新增但状态从 running 到 done 仍发事件。
 - [ ] 原 `scan`／`scan_paths` 汇总旧采集器与新适配器；来源检查、读取和写入结果分开。`ScanResult` 增加 `sources: Vec<SourceStatus>`，保留已有字段兼容现有调用。
-- [ ] `set_session_activity` 接受并保留 `unknown` 和 `waiting` 状态，不再把新适配器未知状态默认改成 done；旧 running/done/failed 行为通过回归测试保留。
+- [x] `set_session_activity` 接受并保留 `unknown` 和 `waiting` 状态，不再把新适配器未知状态默认改成 done；旧 running/done/failed 行为通过回归测试保留。
 - [ ] watcher 目标来自适配器路径列表。JSONL 看目录，SQLite 看数据库与 WAL 所在目录；去抖仍用已有 120ms，保留 10 秒补漏心跳。不要每 120ms 全盘递归。
-- [ ] `list_sources` 返回真实来源，支持国内／国际实例；无来源时返回缺项说明而不是空白成功。
+- [x] `list_sources` 返回真实来源，支持国内／国际实例；无来源时返回缺项说明而不是空白成功。
 - [ ] 额度查询按平台／凭证身份／来源建立缓存键，修改凭证或地址后失效；不将读取会话成功当作额度认证成功。
-- [ ] 为缺少已验证额度接口的平台返回具体 `unsupported` 原因；网络断开、401、403、429、解析失败分别保留现有结构，过期数据标时间。
+- [x] 为缺少已验证额度接口的平台返回具体 `unsupported` 原因；网络断开、401、403、429、解析失败分别保留现有结构，过期数据标时间。
 - [ ] 运行采集器、watcher、缓存及生命周期测试；验证切换灵动岛平台后旧 cursor 不造成新增动画或漏更新。
 
 ## 任务 7：前端页面、统计、会话与灵动岛

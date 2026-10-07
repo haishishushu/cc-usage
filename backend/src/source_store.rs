@@ -12,6 +12,8 @@ pub struct Record {
     pub billable: Option<bool>,
     pub context_ratio: Option<f64>,
     pub reasoning: Option<i64>,
+    /// 工具调用提示 Token（Gemini `tokens.tool`）。来源没有该字段时为 None。
+    pub tool: Option<i64>,
 }
 
 pub fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -45,7 +47,10 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     CREATE TRIGGER IF NOT EXISTS legacy_input_semantics AFTER INSERT ON requests
     WHEN NEW.input_semantics='unknown' AND NEW.platform IN ('claude','codex')
     BEGIN UPDATE requests SET input_semantics=CASE NEW.platform WHEN 'claude' THEN 'excludes_cache' ELSE 'includes_cache' END WHERE id=NEW.id; END;
-    ")
+    ")?;
+    // 旧库补列：工具调用提示 Token（Gemini tokens.tool）。
+    let _ = conn.execute("ALTER TABLE request_metrics ADD COLUMN tool INTEGER", []);
+    Ok(())
 }
 
 /// 清理历史后的采集下限：早于它的记录不再重新入库。
@@ -101,13 +106,13 @@ pub fn write(conn: &Connection, records: &[Record]) -> rusqlite::Result<usize> {
             Some((id, _, _)) => id,
             None => conn.last_insert_rowid(),
         };
-        let metric_count = conn.prepare_cached("INSERT INTO request_metrics(request_id,credits,original_credits,billable,context_ratio,reasoning)
-            VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(request_id) DO UPDATE SET credits=excluded.credits,
-            original_credits=excluded.original_credits,billable=excluded.billable,context_ratio=excluded.context_ratio,reasoning=excluded.reasoning
-            WHERE (credits,original_credits,billable,context_ratio,reasoning) IS NOT
-              (excluded.credits,excluded.original_credits,excluded.billable,excluded.context_ratio,excluded.reasoning)",
+        let metric_count = conn.prepare_cached("INSERT INTO request_metrics(request_id,credits,original_credits,billable,context_ratio,reasoning,tool)
+            VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(request_id) DO UPDATE SET credits=excluded.credits,
+            original_credits=excluded.original_credits,billable=excluded.billable,context_ratio=excluded.context_ratio,reasoning=excluded.reasoning,tool=excluded.tool
+            WHERE (credits,original_credits,billable,context_ratio,reasoning,tool) IS NOT
+              (excluded.credits,excluded.original_credits,excluded.billable,excluded.context_ratio,excluded.reasoning,excluded.tool)",
         )?.execute(
-            params![id,item.credits,item.original_credits,item.billable,item.context_ratio,item.reasoning])?;
+            params![id,item.credits,item.original_credits,item.billable,item.context_ratio,item.reasoning,item.tool])?;
         if count > 0 || metric_count > 0 {
             changed += 1;
         }
@@ -136,6 +141,10 @@ pub struct Metrics {
     pub credit_requests: i64,
     pub context_ratio: Option<f64>,
     pub context_at_ms: Option<i64>,
+    /// 区间内思考 / 推理 Token 合计；来源不提供时为 None。
+    pub reasoning: Option<i64>,
+    /// 区间内工具调用提示 Token 合计（Gemini tokens.tool）；来源不提供时为 None。
+    pub tool: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,9 +197,9 @@ pub fn metrics(
     end: i64,
     model: Option<&str>,
 ) -> rusqlite::Result<Metrics> {
-    let (credits,credit_requests) = conn.query_row("SELECT SUM(m.credits),COUNT(m.credits) FROM request_metrics m
+    let (credits,credit_requests,reasoning,tool) = conn.query_row("SELECT SUM(m.credits),COUNT(m.credits),SUM(m.reasoning),SUM(m.tool) FROM request_metrics m
         JOIN requests r ON r.id=m.request_id WHERE r.platform=?1 AND r.ts>=?2 AND r.ts<?3 AND (?4 IS NULL OR r.model=?4)",
-        params![platform,start,end,model], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        params![platform,start,end,model], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     let context: Option<(f64,i64)> = conn.query_row("SELECT ratio,ts FROM (
         SELECT m.context_ratio AS ratio,r.ts AS ts FROM request_metrics m
         JOIN requests r ON r.id=m.request_id WHERE r.platform=?1 AND r.ts>=?2 AND r.ts<?3 AND m.context_ratio IS NOT NULL
@@ -203,6 +212,8 @@ pub fn metrics(
         credit_requests,
         context_ratio: context.map(|c| c.0),
         context_at_ms: context.map(|c| c.1),
+        reasoning,
+        tool,
     })
 }
 
@@ -231,6 +242,7 @@ mod tests {
             billable: None,
             context_ratio: None,
             reasoning: None,
+            tool: None,
         }
     }
     #[test]

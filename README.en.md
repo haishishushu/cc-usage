@@ -42,7 +42,7 @@ A desktop island and full dashboard for local AI coding usage and provider quota
 | Feature | What it provides |
 | --- | --- |
 | Desktop island | Current connection quota, reset timers, and session activity for supported sources; double-click to expand and drag to dock |
-| Dashboard | Token breakdowns, cache usage, request counts, and available cost estimates by platform, date range, and model |
+| Dashboard | Token breakdowns, cache usage, request counts, and available cost estimates by platform, date range, and model; API key connections used through the local proxy can switch to a per-connection view |
 | Request logs | Paginated records with model, input/output usage, costs, and available status or timing information |
 | Connections | Read local authorization or API configuration; check, enable, disconnect, edit, and remove connections |
 | Coding-plan quotas | Recognize supported provider URLs and display the quota windows returned by the service |
@@ -57,11 +57,11 @@ Local usage and online quotas are independent: **local sessions do not guarantee
 
 | Platform | Implemented capabilities | Boundaries |
 | --- | --- | --- |
-| Claude | Claude Code local sessions, tokens and cost estimates, official subscription and supported gateway queries | Quotas require valid authorization; local usage is aggregated by platform |
-| Codex | Codex CLI local sessions, tokens and cost estimates, official subscription and supported gateway queries | Local usage cannot be attributed separately to multiple accounts or keys on the same platform |
-| Gemini | Gemini CLI local sessions and token increments | Online remaining quota is not integrated |
+| Claude | Claude Code local sessions, tokens and cost estimates, official subscription and supported gateway queries | Quotas require valid authorization; local usage outside the local proxy is aggregated by platform, while proxied API key connections can be attributed per connection |
+| Codex | Codex CLI local sessions, tokens and cost estimates, official subscription and supported gateway queries | Local usage outside the local proxy is merged per platform; proxied API key connections can be attributed per connection, OAuth tokens are not matched |
+| Gemini | Gemini CLI local sessions and token increments (including thinking and tool tokens) with cost estimates from the official price list | Online remaining quota is not integrated; costs are estimates at API list prices |
 | Grok | SuperGrok remaining subscription percentage through local OAuth | No local session statistics; prepaid API balance needs separate management authorization |
-| Zcode | Local usage records, token increments, BigModel Coding Plan key queries | Account OAuth quota is not integrated |
+| Zcode | Local usage records, token increments, session done / failed / running states, BigModel Coding Plan key queries | Account OAuth quota is not integrated |
 | Trae | Local source detection entry | No local session statistics; personal quota is unverified and enterprise quota requires administrator authorization |
 | Qoder | Local records and recorded credits for domestic and international editions | Online remaining credits are not integrated; available fields depend on source records |
 | Workbuddy | Local usage, cache, and reported credit consumption | Consumed credits are not remaining credits; online personal remaining credits are not integrated |
@@ -149,6 +149,7 @@ Complete another request in the AI tool, select that platform in the dashboard, 
 2. Choose today, this week, this month, all time, or a custom range; filter by model if needed.
 3. Review token and cache breakdowns, then locate activity peaks in the trend chart.
 4. Inspect individual records in the request log, using pagination and page navigation.
+5. After selecting an API key connection that has been used through the local proxy, switch the local statistics scope to that connection only.
 
 ![Token and cache statistics](./docs/assets/readme/panel-stats.png)
 

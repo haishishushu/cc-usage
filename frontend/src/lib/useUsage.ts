@@ -39,6 +39,7 @@ export function useTokenSummaries(
   refreshKey: number,
   queryEndMs: number,
   model: string | null = null,
+  connection: string | null = null,
 ) {
   const [data, setData] = useState<TokenSummary[]>(isTauri ? [] : TOKEN_SUMMARIES)
   const [live, setLive] = useState(false)
@@ -49,7 +50,7 @@ export function useTokenSummaries(
   useEffect(() => {
     let cancelled = false
     if (!isTauri) return
-    const query = JSON.stringify([platform, custom?.start, custom?.end, model])
+    const query = JSON.stringify([platform, custom?.start, custom?.end, model, connection])
     if (completedQuery.current !== query) {
       setData([])
       setLive(false)
@@ -57,7 +58,7 @@ export function useTokenSummaries(
     }
     setError(null)
     api
-      .tokenTotals(platform, custom, model, queryEndMs)
+      .tokenTotals(platform, custom, model, queryEndMs, connection)
       .then((t) => {
         if (cancelled) return
         completedQuery.current = query
@@ -86,7 +87,7 @@ export function useTokenSummaries(
     return () => {
       cancelled = true
     }
-  }, [platform, custom, refreshKey, queryEndMs, model])
+  }, [platform, custom, refreshKey, queryEndMs, model, connection])
 
   return { summaries: data, live, status, error }
 }
@@ -102,6 +103,7 @@ export function useUsageBreakdown(
   refreshKey: number,
   queryEndMs: number,
   model: string | null = null,
+  connection: string | null = null,
 ) {
   const [data, setData] = useState<UsageBreakdown | null>(isTauri ? null : DEMO_BREAKDOWN)
   const [status, setStatus] = useState<"loading" | "ready" | "failed">(isTauri ? "loading" : "ready")
@@ -111,14 +113,14 @@ export function useUsageBreakdown(
   useEffect(() => {
     let cancelled = false
     if (!isTauri || (period === "custom" && !custom)) return
-    const query = JSON.stringify([platform, period, custom?.start, custom?.end, model])
+    const query = JSON.stringify([platform, period, custom?.start, custom?.end, model, connection])
     if (completedQuery.current !== query) {
       setData(null)
       setStatus("loading")
     }
     setError(null)
     api
-      .usageBreakdown(platform, period, custom, model, queryEndMs)
+      .usageBreakdown(platform, period, custom, model, queryEndMs, connection)
       .then((breakdown) => {
         if (cancelled) return
         completedQuery.current = query
@@ -134,7 +136,7 @@ export function useUsageBreakdown(
     return () => {
       cancelled = true
     }
-  }, [platform, period, custom, refreshKey, queryEndMs, model])
+  }, [platform, period, custom, refreshKey, queryEndMs, model, connection])
 
   return { breakdown: data, status, error }
 }
@@ -149,6 +151,7 @@ export function useModels(
   custom: CustomRange | null,
   refreshKey: number,
   queryEndMs: number,
+  connection: string | null = null,
 ) {
   const [models, setModels] = useState<string[]>(isTauri ? [] : DEMO_MODELS)
 
@@ -156,7 +159,7 @@ export function useModels(
     let cancelled = false
     if (!isTauri || (period === "custom" && !custom)) return
     api
-      .listModels(platform, period, custom, queryEndMs)
+      .listModels(platform, period, custom, queryEndMs, connection)
       .then((list) => {
         if (!cancelled) setModels(list)
       })
@@ -166,7 +169,7 @@ export function useModels(
     return () => {
       cancelled = true
     }
-  }, [platform, period, custom, refreshKey, queryEndMs])
+  }, [platform, period, custom, refreshKey, queryEndMs, connection])
 
   return models
 }
@@ -212,6 +215,7 @@ export function useTrend(
   refreshKey: number,
   queryEndMs: number,
   model: string | null = null,
+  connection: string | null = null,
 ) {
   const [data, setData] = useState<ChartData>(isTauri ? EMPTY_CHART("读取中") : DEMO_TREND)
   const [live, setLive] = useState(false)
@@ -223,7 +227,7 @@ export function useTrend(
     let cancelled = false
     // 自定义周期必须有已生效的范围才查，否则等用户点「确定」
     if (!isTauri || (period === "custom" && !custom)) return
-    const query = JSON.stringify([platform, period, custom?.start, custom?.end, model])
+    const query = JSON.stringify([platform, period, custom?.start, custom?.end, model, connection])
     if (completedQuery.current !== query) {
       setData(EMPTY_CHART("读取中"))
       setLive(false)
@@ -231,7 +235,7 @@ export function useTrend(
     }
     setError(null)
     api
-      .usageTrend(platform, period, custom, model, queryEndMs)
+      .usageTrend(platform, period, custom, model, queryEndMs, connection)
       .then((t) => {
         if (cancelled) return
         completedQuery.current = query
@@ -249,7 +253,7 @@ export function useTrend(
     return () => {
       cancelled = true
     }
-  }, [platform, period, custom, refreshKey, queryEndMs, model])
+  }, [platform, period, custom, refreshKey, queryEndMs, model, connection])
 
   return { chart: data, live, status, error }
 }
@@ -309,6 +313,7 @@ export function useRequestLog(
   refreshKey = 0,
   queryEndMs = 0,
   model: string | null = null,
+  connection: string | null = null,
 ) {
   const [rows, setRows] = useState<RequestLogRow[]>(isTauri ? [] : LOG_ROWS)
   const [totalCount, setTotalCount] = useState<number | null>(isTauri ? 0 : LOG_TOTAL_COUNT)
@@ -321,7 +326,7 @@ export function useRequestLog(
   useEffect(() => {
     let cancelled = false
     if (!isTauri || (period === "custom" && !custom)) return
-    const query = JSON.stringify([platform, period, page, custom?.start, custom?.end, model])
+    const query = JSON.stringify([platform, period, page, custom?.start, custom?.end, model, connection])
     if (completedQuery.current !== query) {
       setRows([])
       setTotalCount(0)
@@ -331,7 +336,7 @@ export function useRequestLog(
     }
     setError(null)
     api
-      .requestLog(platform, period, page, custom ?? null, model, queryEndMs)
+      .requestLog(platform, period, page, custom ?? null, model, queryEndMs, connection)
       .then((p) => {
         if (cancelled) return
         completedQuery.current = query
@@ -353,7 +358,21 @@ export function useRequestLog(
     return () => {
       cancelled = true
     }
-  }, [platform, period, page, custom, refreshKey, queryEndMs, model])
+  }, [platform, period, page, custom, refreshKey, queryEndMs, model, connection])
 
   return { rows, totalCount, pageCount, live, status, error }
+}
+
+/** 经本地代理归账到该连接的请求数。连接为空或非桌面端时为 0。 */
+export function useAttributedCount(connectionId: string | null, refreshKey: number): number {
+  const [count, setCount] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    if (!isTauri || !connectionId) { setCount(0); return }
+    void api.connectionAttributedCount(connectionId)
+      .then((value) => { if (!cancelled) setCount(value) })
+      .catch(() => { if (!cancelled) setCount(0) })
+    return () => { cancelled = true }
+  }, [connectionId, refreshKey])
+  return count
 }

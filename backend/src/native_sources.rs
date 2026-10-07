@@ -537,6 +537,19 @@ fn scan_files(
     Ok((changed, errors))
 }
 
+/// Zcode 每条请求自带状态：completed → done，error / cancelled → failed。
+/// 其余视为进行中，但只在宽限期内算运行中；CLI 异常退出留下的旧行不能长期显示运行。
+pub(crate) const ZCODE_RUNNING_GRACE_MS: i64 = 10 * 60 * 1_000;
+
+pub(crate) fn zcode_session_state(status: &str, ts: i64, now_ms: i64) -> &'static str {
+    match status {
+        "completed" => "done",
+        "error" | "cancelled" => "failed",
+        _ if ts <= now_ms + 60_000 && now_ms - ts <= ZCODE_RUNNING_GRACE_MS => "running",
+        _ => "unknown",
+    }
+}
+
 fn zcode(db: &mut impl Store, source: &Source) -> Result<usize, String> {
     let key = source.path.to_string_lossy().to_string();
     let stamps = db_stamps(&source.path)?;
@@ -617,6 +630,7 @@ fn zcode(db: &mut impl Store, source: &Source) -> Result<usize, String> {
                     billable: None,
                     context_ratio: None,
                     reasoning: number(12)?,
+                    tool: None,
                 },
                 status,
                 row.get::<_, Option<String>>(14)?,
@@ -629,13 +643,10 @@ fn zcode(db: &mut impl Store, source: &Source) -> Result<usize, String> {
     drop(input);
     // 同一会话只需按最新一条写活动状态与标题（活动更新本身按时间只进不退）。
     let mut sessions: HashMap<String, (&'static str, i64, Option<String>)> = HashMap::new();
+    let now_ms = chrono::Utc::now().timestamp_millis();
     for (r, status, title) in &rows {
         let Some(id) = &r.request.session_id else { continue };
-        let state = match status.as_str() {
-            "completed" => "done",
-            "error" | "cancelled" => "failed",
-            _ => "unknown",
-        };
+        let state = zcode_session_state(status, r.request.ts, now_ms);
         let entry = sessions.entry(id.clone()).or_insert((state, r.request.ts, None));
         if r.request.ts >= entry.1 {
             entry.0 = state;
@@ -880,6 +891,71 @@ mod tests {
             crate::connections::list(&conn).unwrap()[0].id,
             "monitor:native:qoder:cn"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn zcode_request_status_drives_session_state_with_running_grace() {
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(zcode_session_state("completed", now, now), "done");
+        assert_eq!(zcode_session_state("error", now, now), "failed");
+        assert_eq!(zcode_session_state("cancelled", now, now), "failed");
+        assert_eq!(zcode_session_state("running", now - 5_000, now), "running");
+        assert_eq!(zcode_session_state("pending", now, now), "running");
+        assert_eq!(zcode_session_state("running", now - ZCODE_RUNNING_GRACE_MS - 1, now), "unknown");
+        assert_eq!(zcode_session_state("running", now + 120_000, now), "unknown", "未来时间戳不可信");
+    }
+    #[test]
+    fn zcode_synthetic_database_yields_real_session_states_and_outcomes() {
+        let root = fixture_dir("zcode");
+        let folder = root.join(".zcode/cli/db");
+        std::fs::create_dir_all(&folder).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        {
+            let input = Connection::open(folder.join("db.sqlite")).unwrap();
+            input.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT);
+                CREATE TABLE model_usage(id TEXT PRIMARY KEY, session_id TEXT, model_id TEXT, status TEXT,
+                  started_at INTEGER, completed_at INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+                  cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER, provider_total_tokens INTEGER,
+                  computed_total_tokens INTEGER, reasoning_tokens INTEGER, raw_usage_json TEXT);").unwrap();
+            for (sid, title) in [("s-run", "进行中"), ("s-done", "已完成"), ("s-fail", "失败"), ("s-stale", "残留")] {
+                input.execute("INSERT INTO session VALUES(?1,?2)", params![sid, title]).unwrap();
+            }
+            let raw = r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}"#;
+            let rows: [(&str, &str, &str, i64, Option<i64>); 4] = [
+                ("u-run", "s-run", "running", now - 2_000, None),
+                ("u-done", "s-done", "completed", now - 5_000, Some(now - 3_000)),
+                ("u-fail", "s-fail", "error", now - 5_000, Some(now - 4_000)),
+                ("u-stale", "s-stale", "running", now - 30 * 60_000, None),
+            ];
+            for (id, sid, status, started, completed) in rows {
+                input.execute("INSERT INTO model_usage VALUES(?1,?2,'glm-4.7',?3,?4,?5,100,20,0,0,120,120,5,?6)",
+                    params![id, sid, status, started, completed, raw]).unwrap();
+            }
+        }
+        let mut conn = crate::db::open(Path::new(":memory:")).unwrap();
+        let result = scan_at(&mut conn, &root, &root);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let state_of = |sid: &str| -> String {
+            conn.query_row("SELECT activity_state FROM sessions WHERE platform='zcode' AND session_id LIKE ?1",
+                [format!("%:{sid}")], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(state_of("s-run"), "running");
+        assert_eq!(state_of("s-done"), "done");
+        assert_eq!(state_of("s-fail"), "failed");
+        assert_eq!(state_of("s-stale"), "unknown", "超过宽限期的进行中行不算运行");
+        let outcome: String = conn.query_row("SELECT native_outcome FROM requests WHERE dedup_key='u-fail'", [], |r| r.get(0)).unwrap();
+        assert_eq!(outcome, "failed");
+        let live = crate::db::live_usage(&conn, "zcode", None).unwrap();
+        let mut states: Vec<(String, String)> = live.active_sessions.iter()
+            .map(|s| (s.title.clone(), s.state.clone())).collect();
+        states.sort();
+        let mut expected = vec![
+            ("已完成".to_string(), "done".to_string()),
+            ("失败".to_string(), "failed".to_string()),
+            ("进行中".to_string(), "running".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(states, expected, "残留行不在 90 秒窗口内，其余按真实状态输出");
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
